@@ -1450,6 +1450,7 @@ jobs:
               CGFloat _u;
               CGPoint _stickOrigin, _stickPos;
               CGFloat _stickR;
+              CALayer *_stickBase, *_stickKnob;   // GPU layers: moving the stick must not redraw the view
               __weak UITouch *_stickTouch;
               BOOL _stickActive;
               uint16_t _down;
@@ -1462,6 +1463,12 @@ jobs:
                   self.opaque = NO;
                   self.userInteractionEnabled = YES;
                   self.contentMode = UIViewContentModeRedraw;
+                  _stickBase = [CALayer layer];
+                  _stickBase.borderWidth = 2;
+                  _stickBase.backgroundColor = [UIColor colorWithWhite:1 alpha:0.06].CGColor;
+                  _stickKnob = [CALayer layer];
+                  [self.layer addSublayer:_stickBase];
+                  [self.layer addSublayer:_stickKnob];
               }
               return self;
           }
@@ -1480,7 +1487,28 @@ jobs:
               _btn[_n++] = (PadBtn){ N64_R,      CGPointMake(RX(36 * u),  26 * u),      22 * u, "R" };
               _btn[_n++] = (PadBtn){ N64_L,      CGPointMake(ios32_cfg.mirror ? W - 90 * u : 90 * u, 26 * u), 22 * u, "L" };
               _btn[_n++] = (PadBtn){ N64_START,  CGPointMake(W / 2,       H - 24 * u),  20 * u, "S" };
+              [self updateStickLayers];
               [self setNeedsDisplay];
+          }
+
+          - (void)updateStickLayers {
+              [CATransaction begin];
+              [CATransaction setDisableActions:YES];
+              BOOL show = ios32_cfg.show_pad;
+              CGPoint o = _stickActive ? _stickOrigin : [self fixedStickOrigin];
+              CGPoint k = _stickActive ? _stickPos : o;
+              CGFloat kr = 24 * _u;
+              _stickBase.hidden = _stickKnob.hidden = !show;
+              _stickBase.opacity = _stickKnob.opacity = ios32_cfg.opacity;
+              _stickBase.bounds = CGRectMake(0, 0, _stickR * 2, _stickR * 2);
+              _stickBase.cornerRadius = _stickR;
+              _stickBase.position = o;
+              _stickBase.borderColor = [UIColor colorWithWhite:1 alpha:_stickActive ? 0.6 : 0.3].CGColor;
+              _stickKnob.bounds = CGRectMake(0, 0, kr * 2, kr * 2);
+              _stickKnob.cornerRadius = kr;
+              _stickKnob.position = k;
+              _stickKnob.backgroundColor = [UIColor colorWithWhite:1 alpha:_stickActive ? 0.4 : 0.18].CGColor;
+              [CATransaction commit];
           }
 
           - (CGPoint)fixedStickOrigin {
@@ -1525,17 +1553,6 @@ jobs:
                   CGSize sz = [s sizeWithFont:font];   // iOS 7-compatible (deprecated later)
                   [s drawAtPoint:CGPointMake(b->c.x - sz.width / 2, b->c.y - sz.height / 2) withFont:font];
               }
-              // analog stick
-              CGPoint o = _stickActive ? _stickOrigin : [self fixedStickOrigin];
-              CGContextSetRGBStrokeColor(g, 1, 1, 1, _stickActive ? 0.6 : 0.3);
-              CGContextSetRGBFillColor(g, 1, 1, 1, 0.06);
-              CGContextAddEllipseInRect(g, CGRectMake(o.x - _stickR, o.y - _stickR, _stickR * 2, _stickR * 2));
-              CGContextDrawPath(g, kCGPathFillStroke);
-              CGPoint k = _stickActive ? _stickPos : o;
-              CGFloat kr = 24 * _u;
-              CGContextSetRGBFillColor(g, 1, 1, 1, _stickActive ? 0.4 : 0.18);
-              CGContextAddEllipseInRect(g, CGRectMake(k.x - kr, k.y - kr, kr * 2, kr * 2));
-              CGContextFillPath(g);
           }
 
           - (BOOL)touchIsOnButton:(CGPoint)p {
@@ -1549,7 +1566,7 @@ jobs:
           }
 
           - (void)recompute:(NSSet *)all {
-              if (!ios32_cfg.show_pad) { ios32_input.touch_buttons = 0; ios32_input.touch_stick_x = 0; ios32_input.touch_stick_y = 0; _down = 0; _stickTouch = nil; _stickActive = NO; return; }
+              if (!ios32_cfg.show_pad) { ios32_input.touch_buttons = 0; ios32_input.touch_stick_x = 0; ios32_input.touch_stick_y = 0; _down = 0; _stickTouch = nil; _stickActive = NO; [self updateStickLayers]; [self setNeedsDisplay]; return; }
               uint16_t m = 0;
               PadBtn c[4];
               [self cButtons:c];
@@ -1578,9 +1595,11 @@ jobs:
                   _stickTouch = nil; _stickActive = NO;
                   ios32_input.touch_stick_x = 0; ios32_input.touch_stick_y = 0;
               }
+              BOOL btnChanged = (m != _down);
               _down = m;
               ios32_input.touch_buttons = m;
-              [self setNeedsDisplay];
+              [self updateStickLayers];                 // cheap: just moves two layers
+              if (btnChanged) [self setNeedsDisplay];   // full CG redraw only when a button toggles
           }
 
           - (void)touchesBegan:(NSSet *)touches withEvent:(UIEvent *)e {
