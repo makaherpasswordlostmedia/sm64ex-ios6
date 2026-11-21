@@ -405,7 +405,7 @@ jobs:
           endif
 
           # Make tools if out of date
-          DUMMY != CC=$(TOOLS_CC) CXX=$(TOOLS_CXX) $(MAKE) -C tools -j1 >&2 || echo FAIL
+          DUMMY != $(MAKE) -C tools -j1 CC="$(TOOLS_CC)" CXX="$(TOOLS_CXX)" >&2 || echo FAIL
           ifeq ($(DUMMY),FAIL)
             $(error Failed to build tools)
           endif
@@ -4763,7 +4763,7 @@ jobs:
       - name: Build host tools first (clean PATH, host gcc)
         run: |
           set -euo pipefail
-          make -C tools -j"$(nproc)" CC=gcc CXX=g++ n64graphics skyconv mio0 aifc_decode
+          make -C tools -j1 CC=gcc CXX=g++
 
       - name: Build
         env:
