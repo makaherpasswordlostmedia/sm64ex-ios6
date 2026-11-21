@@ -98,7 +98,8 @@ jobs:
             -Wno-error -Wno-deprecated-declarations -Wno-implicit-function-declaration \
             -Wno-int-conversion -Wno-incompatible-pointer-types -Wno-everything"
 
-          export PATH="$TCBIN:$PATH"
+          # toolchain goes LAST: host tools (mio0, n64graphics...) must link with the host ld
+          export PATH="$PATH:$TCBIN"
           make ios32 -j"$(nproc)" \
             TARGET_IOS32=1 TARGET_IOS=1 TARGET_WEB=0 \
             VERSION="$VERSION" DEBUG=0 COMPARE=0 \
@@ -4746,6 +4747,24 @@ jobs:
           fi
 
       # --- build ---------------------------------------------------------------
+      - name: Patch extract_assets.py for Linux (no Homebrew)
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import re
+          p = "extract_assets.py"
+          s = open(p).read()
+          s = re.sub(r'    osx_gcc_ver = subprocess\.run\(.*\n', '    osx_gcc_ver = ""\n', s)
+          s = s.replace('"CC=gcc-" + osx_gcc_ver, "CXX=g++-" + osx_gcc_ver', '"CC=gcc", "CXX=g++"')
+          open(p, "w").write(s)
+          PY
+          grep -n 'gmake\|osx_gcc_ver' extract_assets.py
+
+      - name: Build host tools first (clean PATH, host gcc)
+        run: |
+          set -euo pipefail
+          make -C tools -j"$(nproc)" CC=gcc CXX=g++ n64graphics skyconv mio0 aifc_decode
+
       - name: Build
         env:
           VERSION: ${{ inputs.version }}
