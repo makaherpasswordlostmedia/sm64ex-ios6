@@ -616,7 +616,9 @@ jobs:
 
           AS := $(CROSS)as
 
-          ifeq ($(OSX_BUILD),1)
+          ifeq ($(TARGET_IOS32),1)
+          AS := as
+          else ifeq ($(OSX_BUILD),1)
           AS := i686-w64-mingw32-as
           endif
 
