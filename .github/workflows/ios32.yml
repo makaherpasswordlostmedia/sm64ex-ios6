@@ -1,4 +1,4 @@
-name: Build SM64 (iOS 7-9.3.5 armv7)
+name: Build SM64 (iOS 6/7 - 9.3.5 armv7)
 
 # GitHub -> Actions -> "Build SM64 (iOS 7-9.3.5 armv7)" -> Run workflow.
 #
@@ -25,6 +25,19 @@ on:
           - us   # tested layout
           - jp   # experimental
           - eu   # experimental
+      min_ios:
+        description: "Minimum iOS version (deployment target)"
+        required: true
+        type: choice
+        default: "6.0"
+        options:
+          - "6.0"   # iOS 6.0 - 9.3.5, armv7 (iPhone 3GS/4/4S/5, iPad 1-3, iPod 3-5)
+          - "7.0"   # iOS 7.0 - 9.3.5
+      make_deb:
+        description: "Also build a .deb (jailbreak: Cydia/Sileo/dpkg -i)"
+        required: false
+        default: true
+        type: boolean
       rom_file_id:
         description: "Drive file ID of baserom.<region>.z64 (empty = secret DRIVE_ROM_ID)"
         required: false
@@ -40,7 +53,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: sm64-ios32-${{ github.ref }}-${{ inputs.version }}
+  group: sm64-ios32-${{ github.ref }}-${{ inputs.version }}-${{ inputs.min_ios }}
   cancel-in-progress: true
 
 env:
@@ -50,7 +63,7 @@ env:
 
 jobs:
   build:
-    name: SM64 armv7 (${{ inputs.version }})
+    name: SM64 armv7 iOS ${{ inputs.min_ios }}+ (${{ inputs.version }})
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
@@ -92,7 +105,8 @@ jobs:
           [ -d "$SDK" ]         || { echo "SDK not found: $SDK"; exit 1; }
           [ -f "baserom.$VERSION.z64" ] || { echo "Put your own ROM at ./baserom.$VERSION.z64 (not included)"; exit 1; }
 
-          ARCHFLAGS="-target armv7-apple-ios7.0 -arch armv7 -miphoneos-version-min=7.0 -isysroot $SDK"
+          IOS_MIN="${IOS_MIN:-7.0}"   # 6.0 or 7.0 (set by the workflow input min_ios)
+          ARCHFLAGS="-target armv7-apple-ios$IOS_MIN -arch armv7 -miphoneos-version-min=$IOS_MIN -isysroot $SDK"
           # 9.3 SDK legacy module maps confuse modern clang; old code needs relaxed diagnostics.
           COMMON="$ARCHFLAGS -fno-modules -fno-implicit-modules -fno-implicit-module-maps \
             -Wno-error -Wno-deprecated-declarations -Wno-implicit-function-declaration \
@@ -1275,6 +1289,7 @@ jobs:
           	<key>LSRequiresIPhoneOS</key><true/>
           	<key>UIRequiredDeviceCapabilities</key><array><string>armv7</string><string>opengles-2</string></array>
           	<key>UIDeviceFamily</key><array><integer>1</integer><integer>2</integer></array>
+          	<key>UILaunchImageFile</key><string>LaunchImage</string>
           	<key>UILaunchImages</key>
           	<array>
           		<dict>
@@ -1877,6 +1892,7 @@ jobs:
               [self.window makeKeyAndVisible];
               app.idleTimerDisabled = YES;
 
+              if (NSClassFromString(@"GCController")) {   // absent on iOS 6
               [[NSNotificationCenter defaultCenter] addObserverForName:GCControllerDidConnectNotification
                                                                 object:nil queue:nil
                                                             usingBlock:^(NSNotification *n) { gc_attach(n.object); }];
@@ -1887,6 +1903,8 @@ jobs:
                   ios32_input.pad_stick_x = 0;   ios32_input.pad_stick_y = 0;
               }];
               for (GCController *c in [GCController controllers]) gc_attach(c);
+              }
+              [app setStatusBarHidden:YES withAnimation:UIStatusBarAnimationNone];   // iOS 6 (no prefersStatusBarHidden)
 
               NSThread *t = [[NSThread alloc] initWithTarget:self selector:@selector(gameMain:) object:nil];
               t.stackSize = 8 * 1024 * 1024;
@@ -4767,9 +4785,18 @@ jobs:
           set -euo pipefail
           make -C tools -j1 CC=gcc CXX=g++
 
+      - name: Set deployment target in Info.plist
+        env:
+          IOS_MIN: ${{ inputs.min_ios }}
+        run: |
+          set -euo pipefail
+          sed -i -E "s#(<key>MinimumOSVersion</key><string>)[^<]*#\\1${IOS_MIN}#" ios32/Info.plist
+          grep MinimumOSVersion ios32/Info.plist
+
       - name: Build
         env:
           VERSION: ${{ inputs.version }}
+          IOS_MIN: ${{ inputs.min_ios }}
         run: |
           set -euo pipefail
           chmod +x build_ios32.sh
@@ -4803,14 +4830,54 @@ jobs:
           set -euo pipefail
           SRC="build/sm64ios32.ipa"
           [ -f "$SRC" ] || { echo "::error::$SRC not produced"; exit 1; }
-          cp "$SRC" "SM64-armv7-${VERSION}-$(git rev-parse --short HEAD).ipa"
+          cp "$SRC" "SM64-armv7-ios${{ inputs.min_ios }}-${VERSION}-$(git rev-parse --short HEAD).ipa"
           unzip -l SM64-armv7-*.ipa | grep -q "Payload/sm64ios32.app/sm64ios32" || { echo "::error::ipa layout wrong"; exit 1; }
           ls -la SM64-armv7-*.ipa
 
+      - name: Pack .deb (jailbreak install to /Applications)
+        if: inputs.make_deb
+        env:
+          VERSION: ${{ inputs.version }}
+          IOS_MIN: ${{ inputs.min_ios }}
+        run: |
+          set -euo pipefail
+          APP="build/sm64ios32.app"
+          ROOT="$RUNNER_TEMP/deb"
+          rm -rf "$ROOT" && mkdir -p "$ROOT/Applications" "$ROOT/DEBIAN"
+          cp -a "$APP" "$ROOT/Applications/sm64ios32.app"
+          find "$ROOT/Applications" -type d -exec chmod 755 {} +
+          find "$ROOT/Applications" -type f -exec chmod 644 {} +
+          chmod 755 "$ROOT/Applications/sm64ios32.app/sm64ios32"
+          SIZE="$(du -sk "$ROOT/Applications" | cut -f1)"
+          cat > "$ROOT/DEBIAN/control" <<EOF_CTL
+          Package: com.example.sm64ex.armv7
+          Name: Super Mario 64 (armv7)
+          Version: 0.1.${{ github.run_number }}
+          Architecture: iphoneos-arm
+          Description: SM64 port for 32-bit iOS (armv7), touch controls + cheats panel. No ROM included.
+          Maintainer: sm64ex-ios32
+          Author: sm64ex-ios32
+          Section: Games
+          Depends: firmware (>= ${IOS_MIN})
+          Installed-Size: ${SIZE}
+          EOF_CTL
+          sed -i 's/^[[:space:]]*//' "$ROOT/DEBIAN/control"
+          printf '#!/bin/sh\nuicache >/dev/null 2>&1 || true\nexit 0\n' > "$ROOT/DEBIAN/postinst"
+          printf '#!/bin/sh\nuicache >/dev/null 2>&1 || true\nexit 0\n' > "$ROOT/DEBIAN/postrm"
+          chmod 755 "$ROOT/DEBIAN/postinst" "$ROOT/DEBIAN/postrm"
+          OUT="SM64-armv7-ios${IOS_MIN}-${VERSION}-$(git rev-parse --short HEAD).deb"
+          # gzip: old iOS dpkg (iOS 6/7 Cydia) cannot read xz/zstd members
+          dpkg-deb --root-owner-group -Zgzip -b "$ROOT" "$OUT"
+          dpkg-deb -I "$OUT"
+          dpkg-deb -c "$OUT" | head -15
+          ls -la "$OUT"
+
       - uses: actions/upload-artifact@v4
         with:
-          name: SM64-armv7-iOS7-${{ inputs.version }}
-          path: SM64-armv7-*.ipa
+          name: SM64-armv7-iOS${{ inputs.min_ios }}-${{ inputs.version }}
+          path: |
+            SM64-armv7-*.ipa
+            SM64-armv7-*.deb
           if-no-files-found: error
 
       - uses: actions/upload-artifact@v4
