@@ -107,7 +107,7 @@ jobs:
             LDID="$TCBIN/ldid" "$@"
 
           echo
-          echo "Built: build/${VERSION}_pc/sm64ios32.ipa"
+          echo "Built: build/sm64ios32.ipa"
           EOF_SM64
           cat > Makefile <<'EOF_SM64'
 
@@ -4780,7 +4780,7 @@ jobs:
           VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          APP="build/${VERSION}_pc/sm64ios32.app"
+          APP="build/sm64ios32.app"
           BIN="$APP/sm64ios32"
           [ -f "$BIN" ] || { echo "::error::binary not found: $BIN"; exit 1; }
           file "$BIN"
@@ -4801,7 +4801,7 @@ jobs:
           VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          SRC="build/${VERSION}_pc/sm64ios32.ipa"
+          SRC="build/sm64ios32.ipa"
           [ -f "$SRC" ] || { echo "::error::$SRC not produced"; exit 1; }
           cp "$SRC" "SM64-armv7-${VERSION}-$(git rev-parse --short HEAD).ipa"
           unzip -l SM64-armv7-*.ipa | grep -q "Payload/sm64ios32.app/sm64ios32" || { echo "::error::ipa layout wrong"; exit 1; }
