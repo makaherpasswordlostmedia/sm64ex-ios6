@@ -1,0 +1,1188 @@
+# Single-file iOS 5 (armv7) build of sm64ex-ios.
+# Put this ONE file at .github/workflows/ios5.yml in your sm64ex-ios6-ios repo. It carries the whole port
+# (patch + new files + resources generator) and applies it on the runner. Nothing else to copy.
+#
+# Secrets needed: BASEROM_US_B64  (base64 of YOUR baserom.us.z64:  base64 -i baserom.us.z64 | pbcopy)
+# NOT verified by me: hosted macOS runners may no longer ship an Xcode that can still target armv7 / iOS 5.
+# If "Select Xcode" fails, run this on a self-hosted Mac with Xcode 9.4 or older (change runs-on).
+name: sm64ex iOS5 build
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "**" ]
+jobs:
+  build:
+    runs-on: ${{ vars.IOS5_RUNNER || 'macos-12' }}
+    env:
+      SDL_VER: 2.0.8
+      MINVER: "5.0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode that can still build armv7
+        run: |
+          for x in /Applications/Xcode_9*.app /Applications/Xcode_10.1*.app /Applications/Xcode_13*.app; do
+            [ -d "$x" ] && sudo xcode-select -s "$x" && break
+          done
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path || { echo "No iphoneos SDK"; exit 1; }
+          brew install make ldid || true
+
+      - name: Apply iOS 5 port
+        run: |
+          cat > ios5.patch <<'PATCH_EOF'
+          --- a/Makefile
+          +++ b/Makefile
+          @@ -29,6 +29,8 @@
+
+           # Build for iOS devices
+           TARGET_IOS ?= 1
+          +# Build for iOS 5.x (armv7). Use build_ios5.sh.
+          +IOS5 ?= 0
+
+           # Makeflag to enable OSX fixes
+           OSX_BUILD ?= 1
+          @@ -551,8 +553,16 @@
+               BACKEND_LDFLAGS += -lGLESv2
+             else ifeq ($(TARGET_IOS),1)
+           	ifeq ($(TARGET_OS_IOS),1)
+          +      ifeq ($(IOS5),1)
+          +        # iOS 5.x / armv7: only frameworks that exist on iOS 5. No CoreHaptics (iOS 13),
+          +        # Metal (iOS 8), GameController (iOS 7), IOKit (private on iOS).
+          +        IOS5_STDLIB ?= -lc++
+          +        BACKEND_LDFLAGS += -framework OpenGLES -framework AVFoundation -framework AudioToolbox -framework CoreFoundation -framework CoreGraphics -framework CoreAudio -framework Foundation -framework UIKit -framework QuartzCore -framework CoreMotion $(IOS5_EXTRA_LDFLAGS) -L. -lSDL2 $(IOS5_STDLIB)
+          +        BACKEND_CFLAGS += -DTARGET_OS_IOS -DIOS5_COMPAT
+          +      else
+                 BACKEND_LDFLAGS += -framework OpenGLES -framework AVFoundation -framework AudioToolbox -framework CoreFoundation -framework CoreGraphics -framework CoreBluetooth -framework CoreAudio -framework IOKit -framework GameController -framework Foundation -framework UIKit -framework QuartzCore -framework CoreMotion -framework CoreHaptics -framework Metal -L. -lSDL2 -lc++ -lstdc++ -D.
+                 BACKEND_CFLAGS += -DTARGET_OS_IOS
+          +      endif
+               else
+           	  BACKEND_LDFLAGS += -framework OpenGLES -framework AVFoundation -framework AudioToolbox -framework CoreFoundation -framework CoreGraphics -framework CoreBluetooth -framework CoreAudio -framework GameController -framework Foundation -framework UIKit -framework QuartzCore -framework CoreHaptics -framework Metal -L. -lSDL2 -lc++ -lstdc++ -D.
+           	  BACKEND_CFLAGS += -DTARGET_OS_TV
+          --- a/src/ios/FrameController.m
+          +++ b/src/ios/FrameController.m
+          @@ -17,13 +17,14 @@
+
+           - (void)startMainLoop {
+               self.gfxDisplayLink = [[CADisplayLink displayLinkWithTarget:self selector:@selector(tick:)] retain];
+          -    self.gfxDisplayLink.preferredFramesPerSecond = 60;
+          +    // frameInterval 1 == every vsync (60 Hz). preferredFramesPerSecond is iOS 10+.
+          +    self.gfxDisplayLink.frameInterval = 1;
+               [self.gfxDisplayLink addToRunLoop:[NSRunLoop currentRunLoop] forMode:NSRunLoopCommonModes];
+           }
+
+           - (void)tick:(CADisplayLink *)sender {
+          -    for(int i = 0; i < self.onScreenRefresh.count; i++) {
+          -        ((void (*)())[self.onScreenRefresh[i] pointerValue])();
+          +    for(NSUInteger i = 0; i < [self.onScreenRefresh count]; i++) {
+          +        ((void (*)(void))[[self.onScreenRefresh objectAtIndex:i] pointerValue])();
+               }
+           }
+
+          --- a/src/ios/GameTimer.m
+          +++ b/src/ios/GameTimer.m
+          @@ -20,8 +20,8 @@
+           }
+
+           - (void)tick:(NSTimer *)sender {
+          -    for(int i = 0; i < self.onGameTick.count; i++) {
+          -        ((void (*)())[self.onGameTick[i] pointerValue])();
+          +    for(NSUInteger i = 0; i < [self.onGameTick count]; i++) {
+          +        ((void (*)(void))[[self.onGameTick objectAtIndex:i] pointerValue])();
+               }
+           }
+
+          --- a/src/ios/ios/HapticsController.h
+          +++ b/src/ios/ios/HapticsController.h
+          @@ -1,20 +1,18 @@
+           //
+           //  HapticsController.h
+          -//  sm64ios
+          +//  sm64ios5
+           //
+          -//  Created by Christian Kosman on 9/29/21.
+          +//  iOS 5 replacement: CoreHaptics does not exist before iOS 13, so the only
+          +//  "rumble" available is the phone vibration motor (iPhone only, on/off).
+           //
+
+           #ifndef haptics_controller_h
+           #define haptics_controller_h
+
+           #import <Foundation/Foundation.h>
+          -#import <CoreHaptics/CoreHaptics.h>
+
+           @interface HapticsController : NSObject
+
+          -@property(nonatomic,strong) CHHapticEngine *engine;
+          -@property(nonatomic,strong) id<CHHapticPatternPlayer> player;
+           @property bool active;
+
+           - (id)init;
+          @@ -23,6 +21,6 @@
+
+           @end
+
+          -bool hapticsSupported();
+          +bool hapticsSupported(void);
+
+           #endif /* haptics_controller_h */
+          --- a/src/ios/ios/HapticsController.m
+          +++ b/src/ios/ios/HapticsController.m
+          @@ -1,116 +1,55 @@
+           //
+           //  HapticsController.m
+          -//  sm64ios
+          +//  sm64ios5
+           //
+          -//  Nabbed from SDL_mfijoystick.m
+          +//  Vibration-motor fallback for iOS 5 (no CoreHaptics).
+           //
+
+           #import "HapticsController.h"
+          +#import <AudioToolbox/AudioToolbox.h>
+          +#import <UIKit/UIKit.h>
+          +#include <mach/mach_time.h>
+          +
+          +// kSystemSoundID_Vibrate buzzes for ~0.4 s and can't be cancelled, so never
+          +// re-trigger it more often than this.
+          +#define VIBRATE_MIN_INTERVAL 0.45
+          +
+          +static double now_seconds(void) {
+          +    static mach_timebase_info_data_t tb;
+          +    if (tb.denom == 0) mach_timebase_info(&tb);
+          +    return (double)mach_absolute_time() * tb.numer / tb.denom / 1e9;
+          +}
+
+          -@implementation HapticsController
+          +@implementation HapticsController {
+          +    double lastVibrate;
+          +}
+
+          -- (void)cleanup {
+          -    if(self.player != nil) {
+          -        [self.player cancelAndReturnError:nil];
+          -        self.player = nil;
+          -    }
+          -    if(self.engine != nil) {
+          -        [self.engine stopWithCompletionHandler:nil];
+          -        self.engine = nil;
+          -    }
+          +- (id)init {
+          +    self = [super init];
+          +    lastVibrate = 0.0;
+          +    return self;
+           }
+
+           - (void)rumble:(float)intensity duration:(double)duration {
+          -    @autoreleasepool {
+          -        NSError *error = nil;
+          -        
+          -        if(self.engine == nil) {
+          -            printf("Haptic engine stopped, ignoring rumble\n");
+          -            return;
+          -        }
+          -        
+          -        if(intensity == 0.0f) {
+          -            if(self.player && self.active) {
+          -                [self.player stopAtTime:0 error:&error];
+          -            }
+          -            self.active = false;
+          -            return;
+          -        }
+          -        
+          -        if(self.player == nil) {
+          -            CHHapticEventParameter *param = [[CHHapticEventParameter alloc] initWithParameterID:CHHapticEventParameterIDHapticIntensity value:intensity];
+          -            CHHapticEventParameter *param2 = [[CHHapticEventParameter alloc] initWithParameterID:CHHapticEventParameterIDHapticSharpness value:1.0f];
+          -            CHHapticEvent *event = [[CHHapticEvent alloc] initWithEventType:CHHapticEventTypeHapticContinuous parameters:[NSArray arrayWithObjects:param, param2, nil] relativeTime:0 duration:duration];
+          -            
+          -            CHHapticPattern *pattern = [[CHHapticPattern alloc] initWithEvents:[NSArray arrayWithObject:event] parameters:[[NSArray alloc] init] error:&error];
+          -            if(error != nil) {
+          -                printf("Could not create haptic pattern\n");
+          -            }
+          -            
+          -            self.player = [self.engine createPlayerWithPattern:pattern error:&error];
+          -            if(error != nil) {
+          -                printf("Could not create haptic player: %s\n", [error.localizedDescription UTF8String]);
+          -            }
+          -            self.active = false;
+          -        }
+          -        
+          -        CHHapticDynamicParameter *param = [[CHHapticDynamicParameter alloc] initWithParameterID:CHHapticDynamicParameterIDHapticIntensityControl value:intensity relativeTime:0];
+          -        [self.player sendParameters:[NSArray arrayWithObject:param] atTime:0 error:&error];
+          -        if(error != nil) {
+          -            printf("Could not update haptic player: %s\n", [error.localizedDescription UTF8String]);
+          -        }
+          -        
+          -        if(!self.active) {
+          -            [self.player startAtTime:0 error:&error];
+          -            self.active = true;
+          -        }
+          +    if (intensity <= 0.0f) {
+          +        self.active = false;
+          +        return;
+          +    }
+          +    self.active = true;
+          +    double t = now_seconds();
+          +    if (t - lastVibrate >= VIBRATE_MIN_INTERVAL) {
+          +        lastVibrate = t;
+          +        AudioServicesPlaySystemSound(kSystemSoundID_Vibrate);
+               }
+           }
+
+          -- (id)init {
+          -    @autoreleasepool {
+          -        self = [super init];
+          -        
+          -        NSError *error = nil;
+          -        self.engine = [[CHHapticEngine alloc] initAndReturnError:&error];
+          -        if(error != nil) {
+          -            printf("Could not create haptic engine\n");
+          -            return nil;
+          -        }
+          -        self.engine.playsHapticsOnly = YES;
+          -        [self.engine startAndReturnError:&error];
+          -        if(error != nil) {
+          -            printf("Could not start haptic engine\n");
+          -            return nil;
+          -        }
+          -        
+          -        __weak __typeof__(self) weakSelf = self;
+          -        [self.engine setStoppedHandler:^(CHHapticEngineStoppedReason reason) {
+          -            HapticsController *_this = weakSelf;
+          -            if(_this == nil)
+          -                return;
+          -            
+          -            _this.player = nil;
+          -            _this.engine = nil;
+          -            printf("Haptic engine stopped\n");
+          -        }];
+          -        
+          -        [self.engine setResetHandler:^() {
+          -            HapticsController *_this = weakSelf;
+          -            if(_this == nil)
+          -                return;
+          -            
+          -            _this.player = nil;
+          -            [_this.engine startAndReturnError:nil];
+          -            printf("Haptic engine reset\n");
+          -        }];
+          -        
+          -        return self;
+          -    }
+          +- (void)cleanup {
+          +    self.active = false;
+           }
+
+           @end
+
+          -bool hapticsSupported() {
+          -    return CHHapticEngine.capabilitiesForHardware.supportsHaptics;
+          +// Only iPhones have a vibration motor (iPad / iPod touch just ignore the call).
+          +bool hapticsSupported(void) {
+          +    return [[[UIDevice currentDevice] model] hasPrefix:@"iPhone"];
+           }
+          --- a/src/ios/ios/TouchControlsViewController.h
+          +++ b/src/ios/ios/TouchControlsViewController.h
+          @@ -15,11 +15,12 @@
+           {
+               CGImageRef imageRef;
+           }
+          -@property (weak, nonatomic) IBOutlet OverlayImageView* subimage;
+          +@property (assign, nonatomic) IBOutlet OverlayImageView* subimage;
+           @property (nonatomic) int buttonTag;
+           @property (nonatomic) CGImageRef imageRef;
+
+           -   (void)setImageRef:(CGImageRef)newImageRef;
+          +-   (void)setRotation:(CGFloat)angle;
+           -   (id)initWithFrame:(CGRect)frame;
+           -   (void)drawRect:(CGRect)rect;
+           @end
+          @@ -33,30 +34,32 @@
+
+           @interface TouchControlsViewController : UIViewController
+
+          -@property (weak, nonatomic) IBOutlet OverlayImageView* m_iv_l;
+          -@property (weak, nonatomic) IBOutlet OverlayImageView* m_iv_r;
+          -@property (weak, nonatomic) IBOutlet OverlayImageView* m_iv_a;
+          -@property (weak, nonatomic) IBOutlet OverlayImageView* m_iv_b;
+          -@property (weak, nonatomic) IBOutlet OverlayImageView* m_iv_z;
+          -@property (weak, nonatomic) IBOutlet OverlayImageView* m_iv_up;
+          -@property (weak, nonatomic) IBOutlet OverlayImageView* m_iv_down;
+          -@property (weak, nonatomic) IBOutlet OverlayImageView* m_iv_left;
+          -@property (weak, nonatomic) IBOutlet OverlayImageView* m_iv_right;
+          -@property (weak, nonatomic) IBOutlet OverlayImageView* m_iv_start;
+          -@property (weak, nonatomic) IBOutlet OverlayImageView* m_iv_menu;
+          -@property (weak, nonatomic) IBOutlet OverlayImageView* m_iv_joystick;
+          -@property (weak, nonatomic) IBOutlet OverlayImageView* m_iv_joystick_bg;
+          -
+          -@property (weak, nonatomic) IBOutlet UIImageView* m_gl_up;
+          -@property (weak, nonatomic) IBOutlet UIImageView* m_gl_down;
+          -@property (weak, nonatomic) IBOutlet UIImageView* m_gl_left;
+          -@property (weak, nonatomic) IBOutlet UIImageView* m_gl_right;
+          -
+          -@property (weak, nonatomic) IBOutlet UIView* m_group_lr;
+          -@property (weak, nonatomic) IBOutlet UIView* m_group_joystick;
+          -@property (weak, nonatomic) IBOutlet UIView* m_group_startmenu;
+          -@property (weak, nonatomic) IBOutlet UIView* m_group_main;
+          -@property (weak, nonatomic) IBOutlet UIView* m_group_cbuttons;
+          +- (void)buildOverlayLayout:(CGSize)sz;
+          +
+          +@property (assign, nonatomic) IBOutlet OverlayImageView* m_iv_l;
+          +@property (assign, nonatomic) IBOutlet OverlayImageView* m_iv_r;
+          +@property (assign, nonatomic) IBOutlet OverlayImageView* m_iv_a;
+          +@property (assign, nonatomic) IBOutlet OverlayImageView* m_iv_b;
+          +@property (assign, nonatomic) IBOutlet OverlayImageView* m_iv_z;
+          +@property (assign, nonatomic) IBOutlet OverlayImageView* m_iv_up;
+          +@property (assign, nonatomic) IBOutlet OverlayImageView* m_iv_down;
+          +@property (assign, nonatomic) IBOutlet OverlayImageView* m_iv_left;
+          +@property (assign, nonatomic) IBOutlet OverlayImageView* m_iv_right;
+          +@property (assign, nonatomic) IBOutlet OverlayImageView* m_iv_start;
+          +@property (assign, nonatomic) IBOutlet OverlayImageView* m_iv_menu;
+          +@property (assign, nonatomic) IBOutlet OverlayImageView* m_iv_joystick;
+          +@property (assign, nonatomic) IBOutlet OverlayImageView* m_iv_joystick_bg;
+          +
+          +@property (assign, nonatomic) IBOutlet OverlayImageView* m_gl_up;
+          +@property (assign, nonatomic) IBOutlet OverlayImageView* m_gl_down;
+          +@property (assign, nonatomic) IBOutlet OverlayImageView* m_gl_left;
+          +@property (assign, nonatomic) IBOutlet OverlayImageView* m_gl_right;
+          +
+          +@property (assign, nonatomic) IBOutlet UIView* m_group_lr;
+          +@property (assign, nonatomic) IBOutlet UIView* m_group_joystick;
+          +@property (assign, nonatomic) IBOutlet UIView* m_group_startmenu;
+          +@property (assign, nonatomic) IBOutlet UIView* m_group_main;
+          +@property (assign, nonatomic) IBOutlet UIView* m_group_cbuttons;
+
+           @end
+
+          --- a/src/ios/ios/TouchControlsViewController.m
+          +++ b/src/ios/ios/TouchControlsViewController.m
+          @@ -6,6 +6,7 @@
+           //
+
+           #import "TouchControlsViewController.h"
+          +#import <UIKit/UIGestureRecognizerSubclass.h>
+           #import "src/pc/controller/controller_touchscreen.h"
+           #include "src/pc/configfile.h"
+           #include <PR/os_cont.h>
+          @@ -94,7 +95,7 @@
+                       if (touch_up_callback != NULL) {
+                           touch_up_callback((void*)&touchEvent);
+                       }
+          -            [trackedTouches setObject:[NSNull null] atIndexedSubscript:i];
+          +            [trackedTouches replaceObjectAtIndex:i withObject:[NSNull null]];
+                   }
+               }
+               if(isAllNull) {
+          @@ -133,6 +134,107 @@
+               bool hidden;
+           }
+
+          +- (void)loadView {
+          +    // Replaces Main.storyboard (Auto Layout needs iOS 6+).
+          +    CGRect screen = [[UIScreen mainScreen] bounds];
+          +    CGFloat w = MAX(screen.size.width, screen.size.height);
+          +    CGFloat h = MIN(screen.size.width, screen.size.height);
+          +    UIView *root = [[[UIView alloc] initWithFrame:CGRectMake(0, 0, w, h)] autorelease];
+          +    root.backgroundColor = [UIColor clearColor];
+          +    root.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+          +    self.view = root;
+          +    [self buildOverlayLayout:CGSizeMake(w, h)];
+          +}
+          +
+          +static OverlayImageView *ios5_make_iv(NSString *name, CGRect frame) {
+          +    OverlayImageView *iv = [[[OverlayImageView alloc] initWithFrame:frame] autorelease];
+          +    iv.image = [UIImage imageNamed:name];
+          +    iv.alpha = 0.7;
+          +    iv.contentMode = UIViewContentModeScaleAspectFit;
+          +    iv.userInteractionEnabled = NO;
+          +    return iv;
+          +}
+          +
+          +// one 'touch_button' base (the hit target / outlet) plus a non-interactive glyph on top
+          +- (OverlayImageView *)addButtonTo:(UIView *)group glyph:(NSString *)glyph at:(CGPoint)p size:(CGFloat)s glyphView:(UIImageView **)gv {
+          +    CGRect f = CGRectMake(p.x, p.y, s, s);
+          +    OverlayImageView *base = ios5_make_iv(@"touch_button", f);
+          +    [group addSubview:base];
+          +    UIImageView *g = (UIImageView *)ios5_make_iv(glyph, f);
+          +    [group addSubview:g];
+          +    if (gv) *gv = g;
+          +    return base;
+          +}
+          +
+          +- (UIView *)makeGroup:(CGRect)frame mask:(UIViewAutoresizing)mask {
+          +    UIView *g = [[[UIView alloc] initWithFrame:frame] autorelease];
+          +    g.backgroundColor = [UIColor clearColor];
+          +    g.autoresizingMask = mask;
+          +    [self.view addSubview:g];
+          +    return g;
+          +}
+          +
+          +- (void)buildOverlayLayout:(CGSize)sz {
+          +    // 64pt buttons on big screens, 48pt on 480x320 devices (iPhone 3GS/4/4S, iPod touch)
+          +    const CGFloat B = (sz.height >= 600.0) ? 64.0 : 48.0;
+          +    const CGFloat G = 8.0;      // gap
+          +    const CGFloat M = (sz.height >= 600.0) ? 40.0 : 16.0;   // edge margin
+          +    const CGFloat J = 2.0 * B;  // joystick base; thumb is J/2 at (J/4, J/4)
+          +
+          +    const UIViewAutoresizing TL = UIViewAutoresizingFlexibleRightMargin | UIViewAutoresizingFlexibleBottomMargin;
+          +    const UIViewAutoresizing TR = UIViewAutoresizingFlexibleLeftMargin  | UIViewAutoresizingFlexibleBottomMargin;
+          +    const UIViewAutoresizing BL = UIViewAutoresizingFlexibleRightMargin | UIViewAutoresizingFlexibleTopMargin;
+          +    const UIViewAutoresizing BR = UIViewAutoresizingFlexibleLeftMargin  | UIViewAutoresizingFlexibleTopMargin;
+          +    const UIViewAutoresizing BC = UIViewAutoresizingFlexibleLeftMargin  | UIViewAutoresizingFlexibleRightMargin | UIViewAutoresizingFlexibleTopMargin;
+          +
+          +    // --- L / R (top left)
+          +    UIView *lr = [self makeGroup:CGRectMake(M, M, 2*B + G, B) mask:TL];
+          +    self.m_group_lr = lr;
+          +    self.m_iv_l = [self addButtonTo:lr glyph:@"icon_l" at:CGPointMake(0, 0) size:B glyphView:NULL];
+          +    self.m_iv_r = [self addButtonTo:lr glyph:@"icon_r" at:CGPointMake(B + G, 0) size:B glyphView:NULL];
+          +
+          +    // --- C buttons (top right), 3x3 grid, arrows rotated in -viewDidLoad
+          +    CGFloat cw = 3*B + 2*G;
+          +    UIView *cb = [self makeGroup:CGRectMake(sz.width - M - cw, M, cw, cw) mask:TR];
+          +    self.m_group_cbuttons = cb;
+          +    UIImageView *gu = nil, *gd = nil, *gl = nil, *gr = nil;
+          +    self.m_iv_up    = [self addButtonTo:cb glyph:@"icon_arrow" at:CGPointMake(B + G, 0)           size:B glyphView:&gu];
+          +    self.m_iv_down  = [self addButtonTo:cb glyph:@"icon_arrow" at:CGPointMake(B + G, 2*(B + G))   size:B glyphView:&gd];
+          +    self.m_iv_left  = [self addButtonTo:cb glyph:@"icon_arrow" at:CGPointMake(0, B + G)           size:B glyphView:&gl];
+          +    self.m_iv_right = [self addButtonTo:cb glyph:@"icon_arrow" at:CGPointMake(2*(B + G), B + G)   size:B glyphView:&gr];
+          +    self.m_gl_up = (OverlayImageView *)gu; self.m_gl_down = (OverlayImageView *)gd; self.m_gl_left = (OverlayImageView *)gl; self.m_gl_right = (OverlayImageView *)gr;
+          +
+          +    // --- Joystick (bottom left)
+          +    UIView *js = [self makeGroup:CGRectMake(M, sz.height - M - J, J, J) mask:BL];
+          +    self.m_group_joystick = js;
+          +    OverlayImageView *bg = ios5_make_iv(@"touch_joystick", CGRectMake(0, 0, J, J));
+          +    OverlayImageView *thumb = ios5_make_iv(@"touch_button", CGRectMake(J/4, J/4, J/2, J/2));
+          +    [js addSubview:bg];
+          +    [js addSubview:thumb];
+          +    bg.subimage = thumb;
+          +    self.m_iv_joystick_bg = bg;
+          +    self.m_iv_joystick = thumb;
+          +
+          +    // --- Z / A / B (bottom right)
+          +    CGFloat mw = 2*B + G, mh = 2*B + G;
+          +    UIView *mn = [self makeGroup:CGRectMake(sz.width - M - mw, sz.height - M - mh, mw, mh) mask:BR];
+          +    self.m_group_main = mn;
+          +    self.m_iv_z = [self addButtonTo:mn glyph:@"icon_z" at:CGPointMake(B + G, 0)       size:B glyphView:NULL];
+          +    self.m_iv_a = [self addButtonTo:mn glyph:@"icon_a" at:CGPointMake(B + G, B + G)   size:B glyphView:NULL];
+          +    self.m_iv_b = [self addButtonTo:mn glyph:@"icon_b" at:CGPointMake(0, B + G)       size:B glyphView:NULL];
+          +
+          +    // --- Menu / Start (bottom center)
+          +    CGFloat sw = 2*B + G;
+          +    UIView *sm = [self makeGroup:CGRectMake((sz.width - sw) / 2.0, sz.height - M - B, sw, B) mask:BC];
+          +    self.m_group_startmenu = sm;
+          +    self.m_iv_menu  = [self addButtonTo:sm glyph:@"icon_menu"  at:CGPointMake(0, 0)       size:B glyphView:NULL];
+          +    self.m_iv_start = [self addButtonTo:sm glyph:@"icon_start" at:CGPointMake(B + G, 0)   size:B glyphView:NULL];
+          +
+          +    // the touch code assumes joystick_size == base size * ui scale before the first touch
+          +    extern int joystick_size;
+          +    joystick_size = (int)(J * ((float)configTouchUiScale / 100.0));
+          +}
+          +
+           - (void)viewDidLoad {
+               [super viewDidLoad];
+
+          @@ -208,8 +310,9 @@
+               }
+           }
+
+          -- (UIRectEdge)preferredScreenEdgesDeferringSystemGestures {
+          -    return UIRectEdgeBottom;
+          +// iOS 5 has no autorotation API besides this one: landscape only.
+          +- (BOOL)shouldAutorotateToInterfaceOrientation:(UIInterfaceOrientation)o {
+          +    return UIInterfaceOrientationIsLandscape(o);
+           }
+
+           @end
+          --- /dev/null
+          +++ b/src/ios/ios5_ui.h
+          @@ -0,0 +1,17 @@
+          +//
+          +//  ios5_ui.h
+          +//  sm64ios5
+          +//
+          +//  Programmatic replacement for Main.storyboard (which needs Auto Layout / iOS 6+).
+          +//  Identifiers: "MenuNav", "TouchControlsViewController", "ExternalScreen".
+          +//
+          +
+          +#ifndef ios5_ui_h
+          +#define ios5_ui_h
+          +
+          +#import <Foundation/Foundation.h>
+          +#import <UIKit/UIKit.h>
+          +
+          +UIViewController *ios5_instantiate_viewcontroller(NSString *identifier);
+          +
+          +#endif /* ios5_ui_h */
+          --- /dev/null
+          +++ b/src/ios/ios5_ui.m
+          @@ -0,0 +1,340 @@
+          +//
+          +//  ios5_ui.m
+          +//  sm64ios5
+          +//
+          +//  Programmatic menus for iOS 5. Replaces Main.storyboard / MenuViewController /
+          +//  SettingsViewController / CheatsViewController / TextureFilterViewController /
+          +//  TouchControlsEnabledViewController / AboutViewController.
+          +//  No Auto Layout, no blocks-with-weak, no iOS 6+ API.
+          +//
+          +
+          +#import "ios5_ui.h"
+          +#import "native_ui_controller.h"
+          +#import "ios/TouchControlsViewController.h"
+          +#import "ios/ExternalGameViewController.h"
+          +#import "ios/HapticsController.h"
+          +#include "src/pc/configfile.h"
+          +#include "src/pc/cheats.h"
+          +
+          +// ---------------------------------------------------------------------------
+          +// Landscape-only navigation controller (iOS 5 rotation API)
+          +// ---------------------------------------------------------------------------
+          +@interface IOS5NavigationController : UINavigationController
+          +@end
+          +
+          +@implementation IOS5NavigationController
+          +- (BOOL)shouldAutorotateToInterfaceOrientation:(UIInterfaceOrientation)o {
+          +    return UIInterfaceOrientationIsLandscape(o);
+          +}
+          +@end
+          +
+          +// ---------------------------------------------------------------------------
+          +// Generic "list of switches" table. Each row: title + getter/setter blocks.
+          +// ---------------------------------------------------------------------------
+          +typedef bool (^IOS5GetBlock)(void);
+          +typedef void (^IOS5SetBlock)(bool);
+          +
+          +@interface IOS5SwitchRow : NSObject
+          +@property (nonatomic, copy) NSString *title;
+          +@property (nonatomic, copy) IOS5GetBlock getter;
+          +@property (nonatomic, copy) IOS5SetBlock setter;
+          +@end
+          +
+          +@implementation IOS5SwitchRow
+          +@synthesize title, getter, setter;
+          +- (void)dealloc { [title release]; [getter release]; [setter release]; [super dealloc]; }
+          +@end
+          +
+          +static IOS5SwitchRow *ios5_row(NSString *title, IOS5GetBlock g, IOS5SetBlock s) {
+          +    IOS5SwitchRow *r = [[[IOS5SwitchRow alloc] init] autorelease];
+          +    r.title = title; r.getter = g; r.setter = s;
+          +    return r;
+          +}
+          +
+          +@interface IOS5SwitchListViewController : UITableViewController
+          +@property (nonatomic, retain) NSArray *rows;
+          +@end
+          +
+          +@implementation IOS5SwitchListViewController
+          +@synthesize rows;
+          +
+          +- (void)dealloc { [rows release]; [super dealloc]; }
+          +
+          +- (BOOL)shouldAutorotateToInterfaceOrientation:(UIInterfaceOrientation)o {
+          +    return UIInterfaceOrientationIsLandscape(o);
+          +}
+          +
+          +- (void)viewWillAppear:(BOOL)animated {
+          +    [super viewWillAppear:animated];
+          +    [self.tableView reloadData];
+          +}
+          +
+          +- (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s { return [rows count]; }
+          +
+          +- (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip {
+          +    static NSString *ident = @"switchcell";
+          +    UITableViewCell *cell = [tv dequeueReusableCellWithIdentifier:ident];
+          +    if (cell == nil) {
+          +        cell = [[[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:ident] autorelease];
+          +        cell.selectionStyle = UITableViewCellSelectionStyleNone;
+          +        cell.accessoryView = [[[UISwitch alloc] initWithFrame:CGRectZero] autorelease];
+          +    }
+          +    IOS5SwitchRow *row = [rows objectAtIndex:ip.row];
+          +    cell.textLabel.text = row.title;
+          +    UISwitch *sw = (UISwitch *)cell.accessoryView;
+          +    [sw removeTarget:nil action:NULL forControlEvents:UIControlEventValueChanged];
+          +    sw.on = row.getter();
+          +    sw.tag = ip.row;
+          +    [sw addTarget:self action:@selector(switchChanged:) forControlEvents:UIControlEventValueChanged];
+          +    return cell;
+          +}
+          +
+          +- (void)switchChanged:(UISwitch *)sw {
+          +    IOS5SwitchRow *row = [rows objectAtIndex:sw.tag];
+          +    row.setter(sw.on);
+          +}
+          +@end
+          +
+          +// ---------------------------------------------------------------------------
+          +// Generic single-choice list (checkmark). Used for texture filter + touch mode.
+          +// ---------------------------------------------------------------------------
+          +@interface IOS5ChoiceViewController : UITableViewController
+          +@property (nonatomic, retain) NSArray *choices;
+          +@property (nonatomic, assign) unsigned int *value;
+          +@end
+          +
+          +@implementation IOS5ChoiceViewController
+          +@synthesize choices, value;
+          +
+          +- (void)dealloc { [choices release]; [super dealloc]; }
+          +
+          +- (BOOL)shouldAutorotateToInterfaceOrientation:(UIInterfaceOrientation)o {
+          +    return UIInterfaceOrientationIsLandscape(o);
+          +}
+          +
+          +- (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s { return [choices count]; }
+          +
+          +- (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip {
+          +    static NSString *ident = @"choicecell";
+          +    UITableViewCell *cell = [tv dequeueReusableCellWithIdentifier:ident];
+          +    if (cell == nil)
+          +        cell = [[[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:ident] autorelease];
+          +    cell.textLabel.text = [choices objectAtIndex:ip.row];
+          +    cell.accessoryType = ((unsigned int)ip.row == *value) ? UITableViewCellAccessoryCheckmark : UITableViewCellAccessoryNone;
+          +    return cell;
+          +}
+          +
+          +- (void)tableView:(UITableView *)tv didSelectRowAtIndexPath:(NSIndexPath *)ip {
+          +    *value = (unsigned int)ip.row;
+          +    configfile_save(configfile_name());
+          +    [tv deselectRowAtIndexPath:ip animated:YES];
+          +    [tv reloadData];
+          +}
+          +@end
+          +
+          +// ---------------------------------------------------------------------------
+          +// About
+          +// ---------------------------------------------------------------------------
+          +@interface IOS5AboutViewController : UIViewController
+          +@end
+          +
+          +@implementation IOS5AboutViewController
+          +
+          +- (BOOL)shouldAutorotateToInterfaceOrientation:(UIInterfaceOrientation)o {
+          +    return UIInterfaceOrientationIsLandscape(o);
+          +}
+          +
+          +- (void)loadView {
+          +    UIView *v = [[[UIView alloc] initWithFrame:[[UIScreen mainScreen] bounds]] autorelease];
+          +    v.backgroundColor = [UIColor groupTableViewBackgroundColor];
+          +    v.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+          +    self.view = v;
+          +    self.title = @"About";
+          +
+          +    NSString *ver = [[[NSBundle mainBundle] infoDictionary] objectForKey:@"CFBundleShortVersionString"];
+          +    if (ver == nil) ver = @"1.0.0";
+          +
+          +    NSArray *lines = [NSArray arrayWithObjects:@"Super Mario 64 iOS", [@"Version " stringByAppendingString:ver], @"iOS 5 (armv7) port", nil];
+          +    CGFloat y = 40;
+          +    for (NSUInteger i = 0; i < [lines count]; i++) {
+          +        UILabel *l = [[[UILabel alloc] initWithFrame:CGRectMake(0, y, v.bounds.size.width, 30)] autorelease];
+          +        l.text = [lines objectAtIndex:i];
+          +        l.textAlignment = (NSInteger)1;   // == UITextAlignmentCenter (iOS 5) == NSTextAlignmentCenter (iOS 6+)
+          +        l.backgroundColor = [UIColor clearColor];
+          +        l.font = (i == 0) ? [UIFont boldSystemFontOfSize:22] : [UIFont systemFontOfSize:15];
+          +        l.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+          +        [v addSubview:l];
+          +        y += (i == 0) ? 36 : 24;
+          +    }
+          +    UIButton *b = [UIButton buttonWithType:UIButtonTypeRoundedRect];
+          +    b.frame = CGRectMake((v.bounds.size.width - 160) / 2, y + 16, 160, 40);
+          +    b.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleRightMargin;
+          +    [b setTitle:@"Source code" forState:UIControlStateNormal];
+          +    [b addTarget:self action:@selector(sourcePressed) forControlEvents:UIControlEventTouchUpInside];
+          +    [v addSubview:b];
+          +}
+          +
+          +- (void)sourcePressed {
+          +    [[UIApplication sharedApplication] openURL:[NSURL URLWithString:@"https://github.com/ckosmic/sm64ex-ios"]];
+          +}
+          +@end
+          +
+          +// ---------------------------------------------------------------------------
+          +// Main menu / settings
+          +// ---------------------------------------------------------------------------
+          +@interface IOS5MenuViewController : UITableViewController
+          +@property (nonatomic, assign) BOOL isSettings;
+          +@end
+          +
+          +@implementation IOS5MenuViewController
+          +@synthesize isSettings;
+          +
+          +- (BOOL)shouldAutorotateToInterfaceOrientation:(UIInterfaceOrientation)o {
+          +    return UIInterfaceOrientationIsLandscape(o);
+          +}
+          +
+          +- (void)viewDidLoad {
+          +    [super viewDidLoad];
+          +    if (!isSettings) {
+          +        paused_by_menu = true;
+          +        self.title = @"Main Menu";
+          +        self.navigationItem.rightBarButtonItem =
+          +            [[[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone target:self action:@selector(donePressed)] autorelease];
+          +    } else {
+          +        self.title = @"Settings";
+          +    }
+          +}
+          +
+          +- (void)viewWillAppear:(BOOL)animated {
+          +    [super viewWillAppear:animated];
+          +    [self.tableView reloadData];
+          +}
+          +
+          +- (void)donePressed {
+          +    paused_by_menu = false;
+          +    [self dismissViewControllerAnimated:YES completion:nil];   // iOS 5.0+
+          +}
+          +
+          +- (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s { return isSettings ? 4 : 3; }
+          +
+          +static NSString *ios5_touch_mode_name(void) {
+          +    switch (configTouchMode) { case 0: return @"Enabled"; case 1: return @"Disabled"; default: return @"Automatic"; }
+          +}
+          +
+          +- (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip {
+          +    if (!isSettings) {
+          +        static NSString *ident = @"menucell";
+          +        UITableViewCell *cell = [tv dequeueReusableCellWithIdentifier:ident];
+          +        if (cell == nil) {
+          +            cell = [[[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:ident] autorelease];
+          +            cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+          +        }
+          +        cell.textLabel.text = [[NSArray arrayWithObjects:@"Settings", @"Cheats", @"About", nil] objectAtIndex:ip.row];
+          +        return cell;
+          +    }
+          +    // settings: 0 touch mode >, 1 haptics (switch), 2 texture filtering >, 3 HUD (switch)
+          +    if (ip.row == 0 || ip.row == 2) {
+          +        static NSString *ident = @"settingsnav";
+          +        UITableViewCell *cell = [tv dequeueReusableCellWithIdentifier:ident];
+          +        if (cell == nil) {
+          +            cell = [[[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:ident] autorelease];
+          +            cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+          +        }
+          +        if (ip.row == 0) {
+          +            cell.textLabel.text = @"Touch Controls";
+          +            cell.detailTextLabel.text = ios5_touch_mode_name();
+          +        } else {
+          +            cell.textLabel.text = @"Texture Filtering";
+          +            cell.detailTextLabel.text = (configFiltering == 0) ? @"Nearest" : @"Linear";
+          +        }
+          +        return cell;
+          +    }
+          +    static NSString *ident = @"settingsswitch";
+          +    UITableViewCell *cell = [tv dequeueReusableCellWithIdentifier:ident];
+          +    if (cell == nil) {
+          +        cell = [[[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:ident] autorelease];
+          +        cell.selectionStyle = UITableViewCellSelectionStyleNone;
+          +        cell.accessoryView = [[[UISwitch alloc] initWithFrame:CGRectZero] autorelease];
+          +    }
+          +    UISwitch *sw = (UISwitch *)cell.accessoryView;
+          +    [sw removeTarget:nil action:NULL forControlEvents:UIControlEventValueChanged];
+          +    if (ip.row == 1) {
+          +        cell.textLabel.text = @"Haptics (vibration)";
+          +        sw.on = configHaptics;
+          +        [sw addTarget:self action:@selector(hapticsChanged:) forControlEvents:UIControlEventValueChanged];
+          +    } else {
+          +        cell.textLabel.text = @"Enable HUD";
+          +        sw.on = configHUD;
+          +        [sw addTarget:self action:@selector(hudChanged:) forControlEvents:UIControlEventValueChanged];
+          +    }
+          +    return cell;
+          +}
+          +
+          +- (void)hapticsChanged:(UISwitch *)sw { configHaptics = sw.on; configfile_save(configfile_name()); }
+          +- (void)hudChanged:(UISwitch *)sw     { configHUD = sw.on;     configfile_save(configfile_name()); }
+          +
+          +- (void)tableView:(UITableView *)tv didSelectRowAtIndexPath:(NSIndexPath *)ip {
+          +    [tv deselectRowAtIndexPath:ip animated:YES];
+          +    UIViewController *next = nil;
+          +    if (!isSettings) {
+          +        if (ip.row == 0) {
+          +            IOS5MenuViewController *s = [[[IOS5MenuViewController alloc] initWithStyle:UITableViewStyleGrouped] autorelease];
+          +            s.isSettings = YES;
+          +            next = s;
+          +        } else if (ip.row == 1) {
+          +            IOS5SwitchListViewController *c = [[[IOS5SwitchListViewController alloc] initWithStyle:UITableViewStyleGrouped] autorelease];
+          +            c.title = @"Cheats";
+          +            c.rows = [NSArray arrayWithObjects:
+          +                ios5_row(@"Enable Cheats",       ^bool{ return Cheats.EnableCheats; },  ^(bool v){ Cheats.EnableCheats = v; }),
+          +                ios5_row(@"Moon Jump",           ^bool{ return Cheats.MoonJump; },      ^(bool v){ Cheats.MoonJump = v; }),
+          +                ios5_row(@"God Mode",            ^bool{ return Cheats.GodMode; },       ^(bool v){ Cheats.GodMode = v; }),
+          +                ios5_row(@"Infinite Lives",      ^bool{ return Cheats.InfiniteLives; }, ^(bool v){ Cheats.InfiniteLives = v; }),
+          +                ios5_row(@"Super Speed",         ^bool{ return Cheats.SuperSpeed; },    ^(bool v){ Cheats.SuperSpeed = v; }),
+          +                ios5_row(@"Responsive Controls", ^bool{ return Cheats.Responsive; },    ^(bool v){ Cheats.Responsive = v; }),
+          +                ios5_row(@"Exit Level Anywhere", ^bool{ return Cheats.ExitAnywhere; },  ^(bool v){ Cheats.ExitAnywhere = v; }),
+          +                ios5_row(@"Huge Mario",          ^bool{ return Cheats.HugeMario; },     ^(bool v){ Cheats.HugeMario = v; }),
+          +                ios5_row(@"Tiny Mario",          ^bool{ return Cheats.TinyMario; },     ^(bool v){ Cheats.TinyMario = v; }),
+          +                nil];
+          +            next = c;
+          +        } else {
+          +            next = [[[IOS5AboutViewController alloc] init] autorelease];
+          +        }
+          +    } else if (ip.row == 0) {
+          +        IOS5ChoiceViewController *c = [[[IOS5ChoiceViewController alloc] initWithStyle:UITableViewStyleGrouped] autorelease];
+          +        c.title = @"Touch Controls";
+          +        c.choices = [NSArray arrayWithObjects:@"Enabled", @"Disabled", @"Automatic", nil];
+          +        c.value = &configTouchMode;
+          +        next = c;
+          +    } else if (ip.row == 2) {
+          +        IOS5ChoiceViewController *c = [[[IOS5ChoiceViewController alloc] initWithStyle:UITableViewStyleGrouped] autorelease];
+          +        c.title = @"Texture Filtering";
+          +        c.choices = [NSArray arrayWithObjects:@"Nearest", @"Linear", nil];
+          +        c.value = &configFiltering;
+          +        next = c;
+          +    }
+          +    if (next) [self.navigationController pushViewController:next animated:YES];
+          +}
+          +
+          +- (NSString *)tableView:(UITableView *)tv titleForFooterInSection:(NSInteger)s {
+          +    if (isSettings) return nil;
+          +    NSString *ver = [[[NSBundle mainBundle] infoDictionary] objectForKey:@"CFBundleShortVersionString"];
+          +    return ver ? [@"Version " stringByAppendingString:ver] : nil;
+          +}
+          +@end
+          +
+          +// ---------------------------------------------------------------------------
+          +// Factory (storyboard identifiers -> controllers)
+          +// ---------------------------------------------------------------------------
+          +UIViewController *ios5_instantiate_viewcontroller(NSString *identifier) {
+          +    if ([identifier isEqualToString:@"TouchControlsViewController"]) {
+          +        return [[[TouchControlsViewController alloc] init] autorelease];
+          +    }
+          +    if ([identifier isEqualToString:@"ExternalScreen"]) {
+          +        return [[[ExternalGameViewController alloc] init] autorelease];
+          +    }
+          +    if ([identifier isEqualToString:@"MenuNav"]) {
+          +        IOS5MenuViewController *root = [[[IOS5MenuViewController alloc] initWithStyle:UITableViewStyleGrouped] autorelease];
+          +        return [[[IOS5NavigationController alloc] initWithRootViewController:root] autorelease];
+          +    }
+          +    return nil;
+          +}
+          --- a/src/ios/native_ui_controller.m
+          +++ b/src/ios/native_ui_controller.m
+          @@ -6,12 +6,12 @@
+           //
+
+           #include "native_ui_controller.h"
+          +#include "ios5_ui.h"
+
+           UIViewController *rootVc;
+
+           UIViewController *present_viewcontroller(NSString *vcName, bool animated) {
+          -    UIStoryboard *storyboard = [UIStoryboard storyboardWithName:@"Main" bundle:nil];
+          -    UIViewController *vc = [storyboard instantiateViewControllerWithIdentifier:vcName];
+          +    UIViewController *vc = ios5_instantiate_viewcontroller(vcName);
+               UIViewController *rootViewController = [UIApplication sharedApplication].keyWindow.rootViewController;
+               [rootViewController presentViewController:vc animated:YES completion:nil];
+               return vc;
+          --- a/src/pc/controller/controller_touchscreen.m
+          +++ b/src/pc/controller/controller_touchscreen.m
+          @@ -205,7 +205,7 @@
+           }
+
+           static void touchscreen_init(void) {
+          -    if(hapticsSupported) {
+          +    if(hapticsSupported()) {
+                   haptics = [[HapticsController alloc] init];
+               }
+               [frameController.onScreenRefresh addObject:[NSValue valueWithPointer:update_touch_controls]];
+          @@ -216,8 +216,8 @@
+           void touchscreen_set_imageviews(NSMutableArray *imageViews) {
+               for(int i = 0; i < imageViews.count; i++) {
+                   for(int j = 0; j < ControlElementsLength; j++) {
+          -            if(((OverlayImageView *)imageViews[i]).buttonTag == ControlElements[j].buttonID) {
+          -                ControlElements[j].imageView = imageViews[i];
+          +            if(((OverlayImageView *)[imageViews objectAtIndex:i]).buttonTag == ControlElements[j].buttonID) {
+          +                ControlElements[j].imageView = [imageViews objectAtIndex:i];
+                       }
+                   }
+               }
+          @@ -250,19 +250,19 @@
+           }
+
+           static void touchscreen_rumble_play(float strength, float time) {
+          -    if(configHaptics && hapticsSupported) {
+          +    if(configHaptics && hapticsSupported()) {
+                   [haptics rumble:strength duration:(time * 1000.0)];
+               }
+           }
+
+           static void touchscreen_rumble_stop() {
+          -    if(configHaptics && hapticsSupported) {
+          +    if(configHaptics && hapticsSupported()) {
+                   [haptics rumble:0.0 duration:0.0];
+               }
+           }
+
+           static void touchscreen_shutdown(void) {
+          -    if(hapticsSupported) {
+          +    if(hapticsSupported()) {
+                   [haptics cleanup];
+                   [haptics release];
+               }
+          --- a/src/pc/gfx/gfx_sdl2.m
+          +++ b/src/pc/gfx/gfx_sdl2.m
+          @@ -121,16 +121,9 @@
+
+           #define IS_FULLSCREEN() ((SDL_GetWindowFlags(wnd) & SDL_WINDOW_FULLSCREEN_DESKTOP) != 0)
+
+          -// Bad don't do this
+          -@interface SDL_uikitviewcontroller : UIViewController
+          +// iOS 5: no preferredScreenEdgesDeferringSystemGestures (iOS 11), UIRectEdge is iOS 7.
+
+          -@end
+          -
+          -@implementation SDL_uikitviewcontroller (SDL_uikitviewcontroller_Extensions)
+          -- (UIRectEdge)preferredScreenEdgesDeferringSystemGestures {
+          -    return UIRectEdgeBottom;
+          -}
+          -@end
+          +UIWindow *sdl_uikit_window = nil;
+
+           UIViewController *get_sdl_viewcontroller() {
+               SDL_SysWMinfo systemWindowInfo;
+          @@ -138,6 +131,7 @@
+               SDL_GetWindowWMInfo(wnd, &systemWindowInfo);
+
+               UIWindow *uiWindow = systemWindowInfo.info.uikit.window;
+          +    sdl_uikit_window = uiWindow;
+               return uiWindow.rootViewController;
+           }
+
+          @@ -263,6 +257,18 @@
+               );
+
+               ctx = SDL_GL_CreateContext(wnd);
+          +    if (ctx == NULL) {
+          +        // iOS 5 era GPUs: fall back to a 16-bit depth buffer
+          +        printf("GL context with 24-bit depth failed (%s), retrying with 16-bit\n", SDL_GetError());
+          +        SDL_DestroyWindow(wnd);
+          +        SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 16);
+          +        wnd = SDL_CreateWindow(
+          +            window_title,
+          +            xpos, ypos, configWindow.w, configWindow.h,
+          +            SDL_WINDOW_OPENGL | SDL_WINDOW_SHOWN | SDL_WINDOW_BORDERLESS | SDL_WINDOW_ALLOW_HIGHDPI | SDL_WINDOW_RESIZABLE | SDL_WINDOW_INPUT_FOCUS | SDL_WINDOW_FULLSCREEN
+          +        );
+          +        ctx = SDL_GL_CreateContext(wnd);
+          +    }
+
+               SDL_GL_GetDrawableSize(wnd, &configWindow.w, &configWindow.h);
+               SDL_SetWindowSize(wnd, configWindow.w, configWindow.h);
+          @@ -416,7 +422,7 @@
+                               }
+                           }
+                           break;
+          -#if TARGET_OS_IOS
+          +#if TARGET_OS_IOS && SDL_VERSION_ATLEAST(2, 0, 9)
+                       case SDL_DISPLAYEVENT:
+                           switch(event.display.event) {
+                               case SDL_DISPLAYEVENT_CONNECTED:
+          --- a/src/pc/gfx/gfx_uikit.h
+          +++ b/src/pc/gfx/gfx_uikit.h
+          @@ -23,13 +23,13 @@
+           @interface OverlayView : UIView
+           - (id)initWithFrame:(CGRect)frame;
+           - (void)drawRect:(CGRect)rect;
+          -- (BOOL)prefersHomeIndicatorAutoHidden;
+           @end
+
+           #if TARGET_OS_IOS
+           TouchControlsViewController *tcvc;
+           #endif
+           UIViewController *gameViewController;
+          +extern UIWindow *sdl_uikit_window;
+
+           void gfx_uikit_init(UIViewController *viewControllerPointer);
+           void setup_external_screen();
+          --- a/src/pc/gfx/gfx_uikit.m
+          +++ b/src/pc/gfx/gfx_uikit.m
+          @@ -8,6 +8,7 @@
+           #include <math.h>
+           #import <objc/runtime.h>
+           #import "gfx_uikit.h"
+          +#import "../../ios/ios5_ui.h"
+
+           UIViewController *gameViewController;
+           UIWindow *mainWindow;
+          @@ -34,19 +35,18 @@
+           void gfx_uikit_init(UIViewController *viewControllerPointer) {
+               gameViewController = viewControllerPointer;
+
+          -    mainWindow = [[[UIApplication sharedApplication] delegate] window];
+          +    // Don't rely on SDL's app delegate exposing a "window" property on old SDL versions.
+          +    mainWindow = sdl_uikit_window ? sdl_uikit_window : [[UIApplication sharedApplication] keyWindow];
+
+           #if TARGET_OS_IOS
+          -    UIStoryboard *storyboard = [UIStoryboard storyboardWithName:@"Main" bundle:nil];
+          -    tcvc = [[storyboard instantiateViewControllerWithIdentifier:@"TouchControlsViewController"] retain];
+          +    // iOS 5: Auto Layout (iOS 6+) is unavailable, so the UI is built in code instead of Main.storyboard.
+          +    tcvc = [(TouchControlsViewController *)ios5_instantiate_viewcontroller(@"TouchControlsViewController") retain];
+
+               if([[UIScreen screens] count] > 1) {
+                   setup_external_screen();
+               } else {
+                   [gameViewController.view addSubview:tcvc.view];
+               }
+          -    
+          -    [gameViewController setNeedsUpdateOfScreenEdgesDeferringSystemGestures];
+           #elif TARGET_OS_TV
+               RemoteInputController *remoteInput = [[RemoteInputController alloc] initWithTarget:gameViewController];
+               [remoteInput.onMenuButtonPressed addObject:[NSValue valueWithPointer:tvos_present_main_menu]];
+          @@ -59,10 +59,11 @@
+               [tcvc.view removeFromSuperview];
+               mainWindow.rootViewController = tcvc;
+
+          -    UIStoryboard *storyboard = [UIStoryboard storyboardWithName:@"Main" bundle:nil];
+          -    ExternalGameViewController *externalVc = [storyboard instantiateViewControllerWithIdentifier:@"ExternalScreen"];
+          -    UIScreen *screen = [UIScreen screens][1];
+          -    externalWindow = [[objc_getClass("SDL_uikitwindow") alloc] initWithFrame:screen.bounds];
+          +    ExternalGameViewController *externalVc = (ExternalGameViewController *)ios5_instantiate_viewcontroller(@"ExternalScreen");
+          +    UIScreen *screen = [[UIScreen screens] objectAtIndex:1];
+          +    Class windowClass = objc_getClass("SDL_uikitwindow");
+          +    if (windowClass == Nil) windowClass = [UIWindow class];
+          +    externalWindow = [[windowClass alloc] initWithFrame:screen.bounds];
+               externalWindow.rootViewController = nil;
+               externalWindow.rootViewController = externalVc;
+               externalWindow.screen = screen;
+          @@ -78,7 +79,7 @@
+                   [tcvc.view removeFromSuperview];
+                   mainWindow.rootViewController = gameViewController;
+                   [gameViewController.view addSubview:tcvc.view];
+          -        UIScreen *screen = [UIScreen screens][0];
+          +        UIScreen *screen = [[UIScreen screens] objectAtIndex:0];
+                   gameViewController.view.frame = screen.bounds;
+                   gameViewController.view.contentScaleFactor = screen.scale;
+                   externalWindow.hidden = YES;
+          PATCH_EOF
+          patch -p1 < ios5.patch
+          # storyboard-bound classes, storyboards and tvOS are replaced by code (src/ios/ios5_ui.m)
+          rm -rf src/ios/tvos src/ios/ios/*.storyboard \
+                 src/ios/MenuViewController.* src/ios/CheatsViewController.* src/ios/AboutViewController.* \
+                 src/ios/TextureFilterViewController.* src/ios/ios/SettingsViewController.* \
+                 src/ios/ios/TouchControlsEnabledViewController.*
+          mkdir -p ios5_resources
+          cat > ios5_resources/Info.plist <<'PLIST_EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+          	<key>CFBundleDevelopmentRegion</key>
+          	<string>en</string>
+          	<key>CFBundleDisplayName</key>
+          	<string>SM64</string>
+          	<key>CFBundleExecutable</key>
+          	<string>sm64ios</string>
+          	<key>CFBundleIdentifier</key>
+          	<string>com.sm64ex.ios5</string>
+          	<key>CFBundleInfoDictionaryVersion</key>
+          	<string>6.0</string>
+          	<key>CFBundleName</key>
+          	<string>sm64ios</string>
+          	<key>CFBundlePackageType</key>
+          	<string>APPL</string>
+          	<key>CFBundleShortVersionString</key>
+          	<string>1.0.0</string>
+          	<key>CFBundleVersion</key>
+          	<string>1</string>
+          	<key>CFBundleSupportedPlatforms</key>
+          	<array>
+          		<string>iPhoneOS</string>
+          	</array>
+          	<key>MinimumOSVersion</key>
+          	<string>5.0</string>
+          	<key>UIDeviceFamily</key>
+          	<array>
+          		<integer>1</integer>
+          		<integer>2</integer>
+          	</array>
+          	<key>UIRequiredDeviceCapabilities</key>
+          	<array>
+          		<string>armv7</string>
+          		<string>opengles-2</string>
+          	</array>
+          	<key>UIStatusBarHidden</key>
+          	<true/>
+          	<key>UIViewControllerBasedStatusBarAppearance</key>
+          	<false/>
+          	<key>UIRequiresFullScreen</key>
+          	<true/>
+          	<key>UIFileSharingEnabled</key>
+          	<true/>
+          	<key>UIPrerenderedIcon</key>
+          	<true/>
+          	<key>CFBundleIconFiles</key>
+          	<array>
+          		<string>Icon.png</string>
+          		<string>Icon@2x.png</string>
+          		<string>Icon-72.png</string>
+          		<string>Icon-72@2x.png</string>
+          	</array>
+          	<key>UISupportedInterfaceOrientations</key>
+          	<array>
+          		<string>UIInterfaceOrientationLandscapeLeft</string>
+          		<string>UIInterfaceOrientationLandscapeRight</string>
+          	</array>
+          	<key>UISupportedInterfaceOrientations~ipad</key>
+          	<array>
+          		<string>UIInterfaceOrientationLandscapeLeft</string>
+          		<string>UIInterfaceOrientationLandscapeRight</string>
+          	</array>
+          </dict>
+          </plist>
+          PLIST_EOF
+
+      - name: Generate @1x/@2x images and icons
+        run: |
+          pip3 install pillow --break-system-packages 2>/dev/null || pip3 install pillow
+          python3 - <<'PY_EOF'
+          import glob
+          from PIL import Image
+          src='sm64ios/sm64ios/Assets.xcassets'; out='ios5_resources'
+          for n in ['touch_button','touch_button_dark','touch_joystick','icon_a','icon_b','icon_l','icon_r','icon_z','icon_start','icon_menu','icon_arrow']:
+              im=Image.open(glob.glob(f'{src}/{n}.imageset/*.png')[0]).convert('RGBA')
+              im.save(f'{out}/{n}@2x.png')
+              im.resize((im.width//2,im.height//2),Image.LANCZOS).save(f'{out}/{n}.png')
+          for nm,sz in (('Default.png',(320,480)),('Default@2x.png',(640,960)),('Default-Landscape.png',(1024,748)),('Default-Landscape@2x.png',(2048,1496))):
+              Image.new('RGB',sz,(0,0,0)).save(f'{out}/{nm}')
+          art=Image.open(glob.glob(f'{src}/LSImage.imageset/*.png')[0]).convert('RGBA')
+          for nm,px in (('Icon.png',57),('Icon@2x.png',114),('Icon-72.png',72),('Icon-72@2x.png',144)):
+              c=Image.new('RGBA',(px,px),(200,30,30,255)); a=art.copy(); a.thumbnail((int(px*.9),int(px*.9)),Image.LANCZOS)
+              c.paste(a,((px-a.width)//2,(px-a.height)//2),a); c.convert('RGB').save(f'{out}/{nm}')
+          PY_EOF
+
+      - name: Build SDL2 ${{ env.SDL_VER }} (armv7, iOS ${{ env.MINVER }})
+        run: |
+          curl -fsSL https://libsdl.org/release/SDL2-$SDL_VER.tar.gz | tar xz
+          cd SDL2-$SDL_VER/Xcode-iOS/SDL
+          xcodebuild -project SDL.xcodeproj -target libSDL -configuration Release -sdk iphoneos \
+            ARCHS=armv7 VALID_ARCHS=armv7 ONLY_ACTIVE_ARCH=NO IPHONEOS_DEPLOYMENT_TARGET=$MINVER \
+            CODE_SIGNING_ALLOWED=NO SYMROOT=$PWD/build build
+          cd $GITHUB_WORKSPACE
+          mkdir -p ioslib5/include/SDL2 ioslib5/lib
+          cp SDL2-$SDL_VER/include/*.h ioslib5/include/SDL2/
+          cp "$(find SDL2-$SDL_VER/Xcode-iOS/SDL/build -name 'libSDL2.a' | head -1)" ioslib5/lib/
+
+      - name: Build game
+        env:
+          BASEROM_US_B64: ${{ secrets.BASEROM_US_B64 }}
+        run: |
+          [ -n "$BASEROM_US_B64" ] || { echo "Add secret BASEROM_US_B64"; exit 1; }
+          echo "$BASEROM_US_B64" | base64 -d > baserom.us.z64
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          COMMON="-arch armv7 -miphoneos-version-min=$MINVER -isysroot $SDK -fno-objc-arc -fcommon -Wno-deprecated-declarations -Wno-error"
+          DEFS="-DUSE_GLES -DAAPI_SDL2 -DWAPI_SDL2 -DTARGET_OS_IOS -DIOS5_COMPAT"
+          export CC="clang $COMMON $DEFS" CXX="clang++ $COMMON $DEFS -std=c++11"
+          export IOSINCLUDE="$PWD/ioslib5/include" IOSLIBS="$PWD/ioslib5/lib" TARGET_OS_IOS=1
+          gmake -j4 TARGET_IOS=1 TARGET_OS_IOS=1 IOS5=1
+
+      - name: Package .ipa
+        run: |
+          B=build/us_pc; APP=build/sm64ios.app; rm -rf $APP; mkdir -p $APP
+          if [ -d $B/sm64ios ]; then cp -R $B/sm64ios/. $APP/; else cp $B/sm64ios $APP/sm64ios; fi
+          [ -d $B/res ] && cp -R $B/res $APP/ || true
+          cp ios5_resources/*.png ios5_resources/Info.plist $APP/
+          ldid -S $APP/sm64ios
+          mkdir build/Payload && cp -R $APP build/Payload/ && (cd build && zip -qr sm64ios5.ipa Payload)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sm64ios5-ipa
+          path: build/sm64ios5.ipa
