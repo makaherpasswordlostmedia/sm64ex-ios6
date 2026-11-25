@@ -1,0 +1,3180 @@
+name: Build Super Mario 64 for Symbian^3 (SIS, GLES2)
+
+# SELF-CONTAINED: this single file carries the whole Symbian port (new files + patch) and applies it to the checked-out
+# sm64ex-ios6 sources. Put it at .github/workflows/symbian.yml, nothing else to copy.
+#
+# Run: Actions -> this workflow -> Run workflow.
+# ROM: your own US ROM (z64, big-endian) on Google Drive "anyone with the link": fill rom_file_id or save secret DRIVE_ROM_ID.
+# The ROM is only used on the runner to extract assets into the build; the .sisx is built from that data.
+# Toolchain: https://github.com/fieldops-dev/symbian3-toolchain (macOS runner, first run builds GCC ~2 h and caches it).
+
+on:
+  workflow_dispatch:
+    inputs:
+      rom_file_id:
+        description: "Google Drive ID or link of your US .z64 (empty = secret DRIVE_ROM_ID)"
+        required: false
+        default: ""
+        type: string
+      opt:
+        description: "GCC optimisation"
+        required: true
+        default: "-O2"
+        type: choice
+        options: ["-O2", "-Os", "-O3"]
+      fpu:
+        description: "vfp = hardware FPU (ARM1176, N8/C7/E7). softvfp = fallback if the app crashes at start"
+        required: true
+        default: "vfp"
+        type: choice
+        options: ["vfp", "softvfp"]
+      runner:
+        description: "macOS runner label for the Symbian build"
+        required: true
+        default: "macos-15"
+        type: choice
+        options: ["macos-15", "macos-14", "macos-latest", "macos-26"]
+
+permissions:
+  contents: read
+
+env:
+  TOOLCHAIN_REPO: fieldops-dev/symbian3-toolchain
+  TOOLCHAIN_REF: a96f917e6c8f02fe4f7c2186f8df760d3d9d832a
+  SYMBIAN_VOL: /Volumes/Symbian
+  GNUPOC_COMMIT: d3ddaf58c734ad3ab34dc60a012f9d4768a9ed3e
+  GCC4SYMBIAN_COMMIT: fe1b15a1c25716d5c515f12593080d58f14d4c3f
+
+jobs:
+  assets:
+    name: Extract assets, generate sources and mmp
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Write port sources and patch the repo (everything is embedded in this file)
+        run: |
+          set -euo pipefail
+          mkdir -p "$(dirname src/pc/audio/audio_symbian.c)"
+          cat > src/pc/audio/audio_symbian.c <<'EOF_SM64'
+          // Audio backend for Symbian^3. The game produces 32 kHz stereo s16; the C++ side
+          // (CMdaAudioOutputStream, 44.1 kHz) pulls through Sym_AudioPull, which resamples
+          // linearly. Game and stream callbacks both run on the UI thread: no locking.
+          #ifdef AAPI_SYMBIAN
+
+          #include <stdint.h>
+          #include <string.h>
+
+          #include "audio_api.h"
+          #include "audio_symbian.h"
+          #include "../symbian/sym_host.h"
+
+          #define RING_FRAMES 8192u /* power of two */
+          #define IN_RATE 32000u
+          #define OUT_RATE 44100u
+
+          static int16_t g_ring[RING_FRAMES * 2];
+          static uint32_t g_rd, g_wr; /* in frames */
+          static uint32_t g_phase;    /* 16.16 */
+          static int g_sound = 1;
+
+          static bool audio_symbian_init(void) { return true; }
+
+          static int audio_symbian_buffered(void) { return (int)(g_wr - g_rd); }
+
+          static int audio_symbian_get_desired_buffered(void) { return 1100; }
+
+          static void audio_symbian_play(const uint8_t *buf, size_t len) {
+              const int16_t *in = (const int16_t *)buf;
+              uint32_t frames = (uint32_t)(len / 4);
+              if (RING_FRAMES - (g_wr - g_rd) < frames) return; /* overrun: drop */
+              for (uint32_t i = 0; i < frames; i++) {
+                  uint32_t idx = ((g_wr + i) & (RING_FRAMES - 1)) * 2;
+                  g_ring[idx] = in[i * 2];
+                  g_ring[idx + 1] = in[i * 2 + 1];
+              }
+              g_wr += frames;
+          }
+
+          static void audio_symbian_shutdown(void) {}
+
+          void Sym_SetSound(int on) { g_sound = on; }
+
+          void Sym_AudioPull(short *dst, int frames) {
+              const uint32_t step = (IN_RATE << 16) / OUT_RATE;
+              for (int i = 0; i < frames; i++) {
+                  if (g_wr - g_rd < 2) {
+                      memset(dst + i * 2, 0, (size_t)(frames - i) * 4);
+                      return;
+                  }
+                  {
+                      uint32_t i0 = (g_rd & (RING_FRAMES - 1)) * 2;
+                      uint32_t i1 = ((g_rd + 1) & (RING_FRAMES - 1)) * 2;
+                      int32_t f = (int32_t)(g_phase & 0xFFFF);
+                      int32_t l = g_ring[i0] + (((g_ring[i1] - g_ring[i0]) * f) >> 16);
+                      int32_t r = g_ring[i0 + 1] + (((g_ring[i1 + 1] - g_ring[i0 + 1]) * f) >> 16);
+                      dst[i * 2] = g_sound ? (short)l : 0;
+                      dst[i * 2 + 1] = g_sound ? (short)r : 0;
+                  }
+                  g_phase += step;
+                  g_rd += g_phase >> 16;
+                  g_phase &= 0xFFFF;
+              }
+          }
+
+          struct AudioAPI audio_symbian = {
+              audio_symbian_init,
+              audio_symbian_buffered,
+              audio_symbian_get_desired_buffered,
+              audio_symbian_play,
+              audio_symbian_shutdown
+          };
+
+          #endif
+          EOF_SM64
+          mkdir -p "$(dirname src/pc/audio/audio_symbian.h)"
+          cat > src/pc/audio/audio_symbian.h <<'EOF_SM64'
+          #ifndef AUDIO_SYMBIAN_H
+          #define AUDIO_SYMBIAN_H
+          #include "audio_api.h"
+          extern struct AudioAPI audio_symbian;
+          #endif
+          EOF_SM64
+          mkdir -p "$(dirname src/pc/controller/controller_entry_point_symbian.c)"
+          cat > src/pc/controller/controller_entry_point_symbian.c <<'EOF_SM64'
+          #ifdef TARGET_SYMBIAN
+          #include "lib/src/libultra_internal.h"
+          #include "lib/src/osContInternal.h"
+          #include "macros.h"
+
+          #include "../configfile.h"
+
+          #include "controller_recorded_tas.h"
+          #include "controller_keyboard.h"
+          #include "controller_sdl.h"
+          #ifdef CAPI_SYMBIAN
+          #include "controller_symbian.h"
+          #endif
+          #ifdef TARGET_OS_IOS
+          #include "controller_touchscreen.h"
+          #endif
+
+          // Analog camera movement by Pathétique (github.com/vrmiguel), y0shin and Mors
+          // Contribute or communicate bugs at github.com/vrmiguel/sm64-analog-camera
+
+          static struct ControllerAPI *controller_implementations[] = {
+              &controller_recorded_tas,
+              #if defined(CAPI_SDL2) || defined(CAPI_SDL1)
+              &controller_sdl,
+              #endif
+              &controller_keyboard,
+          #ifdef CAPI_SYMBIAN
+              &controller_symbian,
+          #endif
+          #ifdef TARGET_OS_IOS
+              &controller_touchscreen,
+          #endif
+          };
+
+          s32 osContInit(UNUSED OSMesgQueue *mq, u8 *controllerBits, UNUSED OSContStatus *status) {
+              for (size_t i = 0; i < sizeof(controller_implementations) / sizeof(struct ControllerAPI *); i++)
+                  controller_implementations[i]->init();
+              *controllerBits = 1;
+              return 0;
+          }
+
+          s32 osMotorStart(UNUSED void *pfs) {
+              // Since rumble stops by osMotorStop, its duration is not nessecary.
+              // Set it to 5 seconds and hope osMotorStop() is called in time.
+              if (configRumbleStrength)
+                  controller_rumble_play(configRumbleStrength / 100.0f, 5.0f);
+              return 0;
+          }
+
+          s32 osMotorStop(UNUSED void *pfs) {
+              if (configRumbleStrength)
+                  controller_rumble_stop();
+              return 0;
+          }
+
+          u32 osMotorInit(UNUSED OSMesgQueue *mq, UNUSED void *pfs, UNUSED s32 port) {
+              return 0; // rumble is initialized in the specific backend's init function
+          }
+
+          s32 osContStartReadData(UNUSED OSMesgQueue *mesg) {
+              return 0;
+          }
+
+          void osContGetReadData(OSContPad *pad) {
+              pad->button = 0;
+              pad->stick_x = 0;
+              pad->stick_y = 0;
+              pad->ext_stick_x = 0;
+              pad->ext_stick_y = 0;
+              pad->errnum = 0;
+
+              for (size_t i = 0; i < sizeof(controller_implementations) / sizeof(struct ControllerAPI *); i++) {
+                  controller_implementations[i]->read(pad);
+              }
+          }
+
+          u32 controller_get_raw_key(void) {
+              for (size_t i = 0; i < sizeof(controller_implementations) / sizeof(struct ControllerAPI *); i++) {
+                  u32 vk = controller_implementations[i]->rawkey();
+                  if (vk != VK_INVALID) return vk + controller_implementations[i]->vkbase;
+              }
+              return VK_INVALID;
+          }
+
+          void controller_shutdown(void) {
+              for (size_t i = 0; i < sizeof(controller_implementations) / sizeof(struct ControllerAPI *); i++) {
+                  if (controller_implementations[i]->shutdown)
+                      controller_implementations[i]->shutdown();
+              }
+          }
+
+          void controller_reconfigure(void) {
+              for (size_t i = 0; i < sizeof(controller_implementations) / sizeof(struct ControllerAPI *); i++) {
+                  if (controller_implementations[i]->reconfig)
+                      controller_implementations[i]->reconfig();
+              }
+          }
+
+          void controller_rumble_play(float str, float time) {
+              for (size_t i = 0; i < sizeof(controller_implementations) / sizeof(struct ControllerAPI *); i++) {
+                  if (controller_implementations[i]->rumble_play)
+                      controller_implementations[i]->rumble_play(str, time);
+              }
+          }
+
+          void controller_rumble_stop(void) {
+              for (size_t i = 0; i < sizeof(controller_implementations) / sizeof(struct ControllerAPI *); i++) {
+                  if (controller_implementations[i]->rumble_stop)
+                      controller_implementations[i]->rumble_stop();
+              }
+          }
+          #endif
+          EOF_SM64
+          mkdir -p "$(dirname src/pc/controller/controller_symbian.c)"
+          cat > src/pc/controller/controller_symbian.c <<'EOF_SM64'
+          // Reads the state written by the Symbian UI (touch pad + keys) into the N64 pad.
+          #ifdef CAPI_SYMBIAN
+
+          #include <stdint.h>
+          #include <ultra64.h>
+
+          #include "controller_api.h"
+          #include "controller_symbian.h"
+          #include "../symbian/sym_host.h"
+
+          _Static_assert(SYM_BTN_A == A_BUTTON && SYM_BTN_B == B_BUTTON && SYM_BTN_Z == Z_TRIG, "pad bits");
+          _Static_assert(SYM_BTN_START == START_BUTTON && SYM_BTN_L == L_TRIG && SYM_BTN_R == R_TRIG, "pad bits");
+          _Static_assert(SYM_BTN_CU == U_CBUTTONS && SYM_BTN_CD == D_CBUTTONS, "pad bits");
+          _Static_assert(SYM_BTN_CL == L_CBUTTONS && SYM_BTN_CR == R_CBUTTONS, "pad bits");
+
+          static void sym_c_init(void) {}
+
+          static void sym_c_read(OSContPad *pad) {
+              pad->button |= sym_input.buttons;
+              if (sym_input.stick_x != 0 || sym_input.stick_y != 0) {
+                  pad->stick_x = sym_input.stick_x;
+                  pad->stick_y = sym_input.stick_y;
+              }
+          }
+
+          static u32 sym_c_rawkey(void) { return VK_INVALID; }
+          static void sym_c_rumble_play(float str, float time) { (void)str; (void)time; }
+          static void sym_c_rumble_stop(void) {}
+
+          struct ControllerAPI controller_symbian = {
+              0,
+              sym_c_init,
+              sym_c_read,
+              sym_c_rawkey,
+              sym_c_rumble_play,
+              sym_c_rumble_stop,
+              NULL,
+              NULL
+          };
+
+          #endif
+          EOF_SM64
+          mkdir -p "$(dirname src/pc/controller/controller_symbian.h)"
+          cat > src/pc/controller/controller_symbian.h <<'EOF_SM64'
+          #ifndef CONTROLLER_SYMBIAN_H
+          #define CONTROLLER_SYMBIAN_H
+          #include "controller_api.h"
+          extern struct ControllerAPI controller_symbian;
+          #endif
+          EOF_SM64
+          mkdir -p "$(dirname src/pc/gfx/gfx_symbian.c)"
+          cat > src/pc/gfx/gfx_symbian.c <<'EOF_SM64'
+          // Window manager backend for Symbian^3. EGL lives in the C++ host (symbian/app);
+          // the game and the GL context share the UI thread, so there is nothing to marshal.
+          #ifdef WAPI_SYMBIAN
+
+          #include <stdint.h>
+          #include <stdbool.h>
+
+          #include "gfx_window_manager_api.h"
+          #include "gfx_symbian.h"
+          #include "../configfile.h"
+          #include "../symbian/sym_host.h"
+
+          static int g_w = 640, g_h = 360;
+          static void (*g_run)(void);
+
+          static void gfx_symbian_init(const char *window_title) {
+              (void)window_title;
+              Sym_GlSize(&g_w, &g_h);
+              configWindow.w = g_w;
+              configWindow.h = g_h;
+              sym_log("[GFX] %dx%d", g_w, g_h);
+          }
+
+          static void gfx_symbian_set_keyboard_callbacks(kb_callback_t kd, kb_callback_t ku, void (*all_up)(void)) {
+              (void)kd; (void)ku; (void)all_up;
+          }
+
+          static void gfx_symbian_set_touchscreen_callbacks(void (*d)(void *), void (*m)(void *), void (*u)(void *)) {
+              (void)d; (void)m; (void)u;
+          }
+
+          static void gfx_symbian_main_loop(void (*run_one_game_iter)(void)) {
+              g_run = run_one_game_iter; // stepped by the UI timer, never loops here
+              (void)g_run;
+          }
+
+          static void gfx_symbian_get_dimensions(uint32_t *width, uint32_t *height) {
+              Sym_GlSize(&g_w, &g_h);
+              *width = (uint32_t)g_w;
+              *height = (uint32_t)g_h;
+          }
+
+          static void gfx_symbian_handle_events(void) {}
+          static bool gfx_symbian_start_frame(void) { return true; }
+          static void gfx_symbian_swap_buffers_begin(void) {}
+
+          static void gfx_symbian_swap_buffers_end(void) {
+              sym_overlay_draw();
+              Sym_GlSwap();
+          }
+
+          static double gfx_symbian_get_time(void) { return 0.0; }
+          static void gfx_symbian_shutdown(void) {}
+
+          static void gfx_symbian_reset_dimension_and_pos(void) {
+              configWindow.w = g_w;
+              configWindow.h = g_h;
+              configWindow.reset = false;
+              configWindow.settings_changed = false;
+          }
+
+          struct GfxWindowManagerAPI gfx_symbian = {
+              gfx_symbian_init,
+              gfx_symbian_set_keyboard_callbacks,
+              gfx_symbian_set_touchscreen_callbacks,
+              gfx_symbian_main_loop,
+              gfx_symbian_get_dimensions,
+              gfx_symbian_handle_events,
+              gfx_symbian_start_frame,
+              gfx_symbian_swap_buffers_begin,
+              gfx_symbian_swap_buffers_end,
+              gfx_symbian_get_time,
+              gfx_symbian_shutdown,
+              gfx_symbian_reset_dimension_and_pos
+          };
+
+          #endif
+          EOF_SM64
+          mkdir -p "$(dirname src/pc/gfx/gfx_symbian.h)"
+          cat > src/pc/gfx/gfx_symbian.h <<'EOF_SM64'
+          #ifndef GFX_SYMBIAN_H
+          #define GFX_SYMBIAN_H
+          #include "gfx_window_manager_api.h"
+          extern struct GfxWindowManagerAPI gfx_symbian;
+          #endif
+          EOF_SM64
+          mkdir -p "$(dirname src/pc/pc_main_symbian.c)"
+          cat > src/pc/pc_main_symbian.c <<'EOF_SM64'
+          // Game entry for Symbian^3 (replaces pc_main.m). Same flow as the ios32 port, but the
+          // loop is driven from outside: Sym_Start() -> main_func(), then Sym_Frame() per tick.
+          #ifdef TARGET_SYMBIAN
+          #include <stdlib.h>
+          #include <stdio.h>
+
+          #include "sm64.h"
+
+          #include "game/memory.h"
+          #include "audio/external.h"
+
+          #include "gfx/gfx_pc.h"
+          #include "gfx/gfx_opengl.h"
+          #include "gfx/gfx_symbian.h"
+          #include "audio/audio_symbian.h"
+          #include "audio/audio_api.h"
+          #include "audio/audio_null.h"
+
+          #include "pc_main.h"
+          #include "cliopts.h"
+          #include "configfile.h"
+          #include "controller/controller_api.h"
+          #include "controller/controller_keyboard.h"
+          #include "fs/fs.h"
+
+          #include "game/game_init.h"
+          #include "game/main.h"
+          #include "game/thread6.h"
+          #include "game/display.h"
+
+          #include "symbian/sym_host.h"
+
+          OSMesg D_80339BEC;
+          OSMesgQueue gSIEventMesgQueue;
+
+          s8 gResetTimer;
+          s8 D_8032C648;
+          s8 gDebugLevelSelect;
+          s8 gShowProfiler;
+          s8 gShowDebugText;
+
+          s32 gRumblePakPfs;
+          struct RumbleData gRumbleDataQueue[3];
+          struct StructSH8031D9B0 gCurrRumbleSettings;
+
+          static struct AudioAPI *audio_api;
+          static struct GfxWindowManagerAPI *wm_api;
+          static struct GfxRenderingAPI *rendering_api;
+
+          extern void gfx_run(Gfx *commands);
+          extern void thread5_game_loop(void *arg);
+          extern void create_next_audio_buffer(s16 *samples, u32 num_samples);
+          void game_loop_one_iteration(void);
+
+          static bool inited = false;
+          static int g_render = 1;
+
+          void dispatch_audio_sptask(struct SPTask *spTask) {
+              (void)spTask;
+          }
+
+          void set_vblank_handler(s32 index, struct VblankHandler *handler, OSMesgQueue *queue, OSMesg *msg) {
+              (void)index; (void)handler; (void)queue; (void)msg;
+          }
+
+          void send_display_list(struct SPTask *spTask) {
+              if (!inited || !g_render) return;
+              gfx_run((Gfx *)spTask->task.t.data_ptr);
+          }
+
+          #ifdef VERSION_EU
+          #define SAMPLES_HIGH 656
+          #define SAMPLES_LOW 640
+          #else
+          #define SAMPLES_HIGH 544
+          #define SAMPLES_LOW 528
+          #endif
+
+          void sm64_symbian_frame(int render) {
+              g_render = render;
+              if (render) gfx_start_frame();
+
+              {
+                  const f32 master_mod = (f32)configMasterVolume / 127.0f;
+                  set_sequence_player_volume(SEQ_PLAYER_LEVEL, (f32)configMusicVolume / 127.0f * master_mod);
+                  set_sequence_player_volume(SEQ_PLAYER_SFX, (f32)configSfxVolume / 127.0f * master_mod);
+                  set_sequence_player_volume(SEQ_PLAYER_ENV, (f32)configEnvVolume / 127.0f * master_mod);
+              }
+
+              game_loop_one_iteration();
+              thread6_rumble_loop(NULL);
+
+              {
+                  int samples_left = audio_api->buffered();
+                  u32 num_audio_samples = samples_left < audio_api->get_desired_buffered() ? SAMPLES_HIGH : SAMPLES_LOW;
+                  s16 audio_buffer[SAMPLES_HIGH * 2 * 2];
+                  for (int i = 0; i < 2; i++)
+                      create_next_audio_buffer(audio_buffer + i * (num_audio_samples * 2), num_audio_samples);
+                  audio_api->play((u8 *)audio_buffer, 2 * num_audio_samples * 4);
+              }
+
+              if (render) gfx_end_frame();
+          }
+
+          void audio_shutdown(void) {
+              if (audio_api) {
+                  if (audio_api->shutdown) audio_api->shutdown();
+                  audio_api = NULL;
+              }
+          }
+
+          void game_deinit(void) {
+              if (!inited) return;
+              inited = false;
+              configfile_save(configfile_name());
+              controller_shutdown();
+              audio_shutdown();
+              gfx_shutdown();
+          }
+
+          void sm64_symbian_deinit(void) {
+              game_deinit();
+          }
+
+          void game_exit(void) {
+              game_deinit();
+              sym_leave_frame();
+          }
+
+          void main_func(void) {
+              const char *gamedir = gCLIOpts.GameDir[0] ? gCLIOpts.GameDir : FS_BASEDIR;
+              const char *userpath = gCLIOpts.SavePath[0] ? gCLIOpts.SavePath : sys_user_path();
+              fs_init(sys_ropaths, gamedir, userpath);
+
+              configfile_load(configfile_name());
+
+              {
+                  const size_t poolsize = gCLIOpts.PoolSize ? gCLIOpts.PoolSize : DEFAULT_POOL_SIZE;
+                  u64 *pool = malloc(poolsize);
+                  if (!pool) sys_fatal("Could not alloc main pool (out of memory).");
+                  main_pool_init(pool, pool + poolsize / sizeof(pool[0]));
+                  gEffectsMemoryPool = mem_pool_init(0x4000, MEMORY_POOL_LEFT);
+                  sym_log("main pool %u bytes", (unsigned)poolsize);
+              }
+
+              wm_api = &gfx_symbian;
+              rendering_api = &gfx_opengl_api;
+              audio_api = &audio_symbian;
+              if (!audio_api->init()) audio_api = &audio_null;
+
+              audio_init();
+              sound_init();
+
+              thread5_game_loop(NULL);
+
+              gfx_current_dimensions.width = 0;
+              gfx_current_dimensions.height = 0;
+
+              gfx_init(wm_api, rendering_api, "Super Mario 64 EX (OpenGL ES)");
+              wm_api->set_keyboard_callbacks(keyboard_on_key_down, keyboard_on_key_up, keyboard_on_all_keys_up);
+              wm_api->set_touchscreen_callbacks(NULL, NULL, NULL);
+              configWindow.settings_changed = true;
+              wm_api->reset_dimension_and_pos();
+
+              inited = true;
+              wm_api->main_loop(NULL);
+          }
+
+          int sm64_symbian_init(void) {
+              static char arg0[] = "sm64symbian";
+              char *argv[] = { arg0, NULL };
+              parse_cli_opts(1, argv);
+              main_func();
+              return 0;
+          }
+
+          #endif
+          EOF_SM64
+          mkdir -p "$(dirname src/pc/symbian/sym_host.c)"
+          cat > src/pc/symbian/sym_host.c <<'EOF_SM64'
+          #ifdef TARGET_SYMBIAN
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <stdarg.h>
+          #include <string.h>
+          #include <setjmp.h>
+          #include <sys/time.h>
+
+          #include "sym_host.h"
+
+          struct SymInput sym_input;
+          struct SymSettings sym_cfg = { 1, 1, 55, 100, 1, 0, 0, 1 };
+
+          static char g_dir[260] = "E:/sm64";
+          static FILE *g_log;
+          static char g_err[300];
+          static int g_has_err, g_quit, g_started, g_armed;
+          static jmp_buf g_jb;
+          static SymOverlayFn g_ovl;
+          static void *g_ovl_ctx;
+          static int g_logic_cnt, g_render_cnt, g_fps_logic, g_fps_render;
+          static uint64_t g_fps_t0;
+
+          void sym_set_dir(const char *dir) {
+              strncpy(g_dir, dir, sizeof(g_dir) - 1);
+              g_dir[sizeof(g_dir) - 1] = 0;
+          }
+
+          const char *sym_user_dir(void) { return g_dir; }
+
+          uint64_t sym_time_us(void) {
+              struct timeval tv;
+              gettimeofday(&tv, NULL);
+              return (uint64_t)tv.tv_sec * 1000000ull + tv.tv_usec;
+          }
+
+          static void log_open(void) {
+              char a[300], b[300];
+              if (g_log) return;
+              snprintf(a, sizeof a, "%s/sm64.log", g_dir);
+              snprintf(b, sizeof b, "%s/sm64_prev.log", g_dir);
+              remove(b);
+              rename(a, b);
+              g_log = fopen(a, "w");
+          }
+
+          void sym_log(const char *fmt, ...) {
+              va_list ap;
+              log_open();
+              if (!g_log) return;
+              va_start(ap, fmt);
+              vfprintf(g_log, fmt, ap);
+              va_end(ap);
+              fputc('\n', g_log);
+              fflush(g_log);
+          }
+
+          void sym_fatal(const char *msg) {
+              sym_log("[FATAL] %s", msg);
+              snprintf(g_err, sizeof g_err, "%s", msg);
+              g_has_err = 1;
+              if (g_armed) longjmp(g_jb, 1);
+              exit(1);
+          }
+
+          void sym_request_exit(void) { g_quit = 1; }
+
+          void sym_leave_frame(void) {
+              g_quit = 1;
+              if (g_armed) longjmp(g_jb, 2);
+              exit(0);
+          }
+
+          const char *Sym_Error(void) { return g_has_err ? g_err : NULL; }
+
+          void Sym_SetOverlay(SymOverlayFn fn, void *ctx) {
+              g_ovl = fn;
+              g_ovl_ctx = ctx;
+          }
+
+          void sym_overlay_draw(void) {
+              int w, h;
+              if (!g_ovl) return;
+              Sym_GlSize(&w, &h);
+              g_ovl(g_ovl_ctx, w, h);
+          }
+
+          /* ---------- settings ---------- */
+          static int clampi(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+          void sym_settings_load(void) {
+              char p[300], line[128];
+              FILE *f;
+              snprintf(p, sizeof p, "%s/touch_settings.cfg", g_dir);
+              f = fopen(p, "r");
+              if (!f) return;
+              while (fgets(line, sizeof line, f)) {
+                  char k[48];
+                  int v;
+                  if (sscanf(line, "%47[^=]=%d", k, &v) != 2) continue;
+                  if (!strcmp(k, "sound")) sym_cfg.sound = v != 0;
+                  else if (!strcmp(k, "show_pad")) sym_cfg.show_pad = v != 0;
+                  else if (!strcmp(k, "opacity")) sym_cfg.opacity = clampi(v, 20, 100);
+                  else if (!strcmp(k, "scale")) sym_cfg.scale = clampi(v, 70, 140);
+                  else if (!strcmp(k, "float_stick")) sym_cfg.float_stick = v != 0;
+                  else if (!strcmp(k, "mirror")) sym_cfg.mirror = v != 0;
+                  else if (!strcmp(k, "show_fps")) sym_cfg.show_fps = v != 0;
+                  else if (!strcmp(k, "frameskip")) sym_cfg.frameskip = v != 0;
+              }
+              fclose(f);
+          }
+
+          void sym_settings_save(void) {
+              char p[300];
+              FILE *f;
+              snprintf(p, sizeof p, "%s/touch_settings.cfg", g_dir);
+              f = fopen(p, "w");
+              if (!f) return;
+              fprintf(f, "sound=%d\nshow_pad=%d\nopacity=%d\nscale=%d\nfloat_stick=%d\nmirror=%d\nshow_fps=%d\nframeskip=%d\n",
+                      sym_cfg.sound, sym_cfg.show_pad, sym_cfg.opacity, sym_cfg.scale, sym_cfg.float_stick,
+                      sym_cfg.mirror, sym_cfg.show_fps, sym_cfg.frameskip);
+              fclose(f);
+          }
+
+          /* ---------- lifecycle ---------- */
+          int Sym_Start(void) {
+              int r;
+              if (g_started) return 0;
+              g_armed = 1;
+              if (setjmp(g_jb)) {
+                  g_armed = 0;
+                  return -1;
+              }
+              sym_settings_load();
+              Sym_SetSound(sym_cfg.sound);
+              sym_log("start, dir=%s", g_dir);
+              r = sm64_symbian_init();
+              g_armed = 0;
+              if (r) return -1;
+              g_started = 1;
+              g_fps_t0 = sym_time_us();
+              sym_log("game initialised");
+              return 0;
+          }
+
+          int Sym_Frame(int render) {
+              int jr;
+              uint64_t now;
+              if (!g_started || g_has_err) return -1;
+              g_armed = 1;
+              jr = setjmp(g_jb);
+              if (jr) {
+                  g_armed = 0;
+                  return jr == 2 ? 1 : -1;
+              }
+              sm64_symbian_frame(render);
+              g_armed = 0;
+              g_logic_cnt++;
+              if (render) g_render_cnt++;
+              now = sym_time_us();
+              if (now - g_fps_t0 >= 1000000ull) {
+                  g_fps_logic = g_logic_cnt;
+                  g_fps_render = g_render_cnt;
+                  g_logic_cnt = g_render_cnt = 0;
+                  g_fps_t0 = now;
+              }
+              return g_quit ? 1 : 0;
+          }
+
+          void Sym_Fps(int *logic, int *render) {
+              *logic = g_fps_logic;
+              *render = g_fps_render;
+          }
+
+          void Sym_Shutdown(void) {
+              if (g_started) {
+                  g_started = 0;
+                  g_armed = 0;
+                  sm64_symbian_deinit();
+              }
+              sym_settings_save();
+              if (g_log) {
+                  fclose(g_log);
+                  g_log = NULL;
+              }
+          }
+          #endif
+          EOF_SM64
+          mkdir -p "$(dirname src/pc/symbian/sym_host.h)"
+          cat > src/pc/symbian/sym_host.h <<'EOF_SM64'
+          #ifndef SYM_HOST_H
+          #define SYM_HOST_H
+
+          /* Symbian^3 host interface.
+           * C++ UI (symbian/app) <-> C game core (sm64ex). Everything runs on the UI thread:
+           * one EGL context, the game is stepped from a timer active object. */
+
+          #include <stdint.h>
+          #include <stddef.h>
+
+          #ifdef __cplusplus
+          extern "C" {
+          #endif
+
+          /* N64 pad bits, same values as include/PR/os_cont.h (checked in controller_symbian.c) */
+          enum {
+              SYM_BTN_CR = 0x0001, SYM_BTN_CL = 0x0002, SYM_BTN_CD = 0x0004, SYM_BTN_CU = 0x0008,
+              SYM_BTN_R = 0x0010, SYM_BTN_L = 0x0020,
+              SYM_BTN_START = 0x1000, SYM_BTN_Z = 0x2000, SYM_BTN_B = 0x4000, SYM_BTN_A = 0x8000
+          };
+
+          struct SymInput {
+              uint16_t buttons;
+              int8_t stick_x;
+              int8_t stick_y;
+          };
+          extern struct SymInput sym_input;
+
+          struct SymSettings {
+              int sound;       /* 0/1 */
+              int show_pad;    /* 0/1 */
+              int opacity;     /* 20..100 */
+              int scale;       /* 70..140 */
+              int float_stick; /* 0/1 */
+              int mirror;      /* 0/1 */
+              int show_fps;    /* 0/1 */
+              int frameskip;   /* 0/1 auto */
+          };
+          extern struct SymSettings sym_cfg;
+          void sym_settings_load(void);
+          void sym_settings_save(void);
+
+          /* paths / log / time / fatal */
+          void sym_set_dir(const char *dir); /* e.g. "E:/sm64" */
+          const char *sym_user_dir(void);
+          void sym_log(const char *fmt, ...);
+          uint64_t sym_time_us(void);
+          void sym_fatal(const char *msg) __attribute__((noreturn));
+          void sym_request_exit(void);
+          void sym_leave_frame(void) __attribute__((noreturn)); /* used by game_exit */
+
+          /* lifecycle, called by the UI */
+          int Sym_Start(void);          /* 0 ok, -1 fatal */
+          int Sym_Frame(int render);    /* 0 ok, 1 quit requested, -1 fatal */
+          const char *Sym_Error(void);
+          void Sym_Shutdown(void);
+          void Sym_Fps(int *logic, int *render);
+
+          /* implemented in pc_main_symbian.c */
+          int sm64_symbian_init(void);
+          void sm64_symbian_frame(int render);
+          void sm64_symbian_deinit(void);
+
+          /* implemented by the C++ side (sm64_gl.cpp) */
+          const char *Sym_GlInit(void *rwindow); /* NULL = ok, else error text */
+          void Sym_GlShutdown(void);
+          void Sym_GlSize(int *w, int *h);
+          int Sym_GlSwap(void);
+
+          /* overlay (touch pad, menu) drawn by the UI right before the swap */
+          typedef void (*SymOverlayFn)(void *ctx, int w, int h);
+          void Sym_SetOverlay(SymOverlayFn fn, void *ctx);
+          void sym_overlay_draw(void);
+
+          /* audio (audio_symbian.c) : pulls 44.1kHz stereo s16 */
+          void Sym_AudioPull(short *dst, int frames);
+          void Sym_SetSound(int on);
+
+          #ifdef __cplusplus
+          }
+          #endif
+          #endif
+          EOF_SM64
+          mkdir -p "$(dirname symbian/README_SYMBIAN.md)"
+          cat > symbian/README_SYMBIAN.md <<'EOF_SM64'
+          # Super Mario 64 (sm64ex iOS6 fork) -> Symbian^3
+
+          Port of the sm64ex iOS fork to Nokia N8 / C7 / E7 class devices (ARM11, GLES2, Open C, GCCE).
+
+          ## Build
+          1. Put your own US ROM (z64) on Google Drive (anyone with the link).
+          2. Actions -> "Build Super Mario 64 for Symbian^3" -> Run workflow, fill `rom_file_id` (or secret `DRIVE_ROM_ID`).
+          3. Download `sm64-symbian3` (`sm64.sisx`) and install. First run builds the toolchain (~2 h, cached).
+
+          Local host step (Linux): `baserom.us.z64` in the repo root, then `python3 symbian/tools/prepare_symbian.py`
+          (extracts assets, writes `symbian/app/gen/*.c` wrappers and `symbian/app/group/sm64.mmp`).
+
+          ## Layout
+          - `src/pc/symbian/` host interface, `gfx_symbian.c`, `audio_symbian.c`, `controller_symbian.c`, `pc_main_symbian.c`: C side of the port.
+          - `symbian/app/` Avkon app: EGL (`sm64_gl.cpp`), frame loop + touch + menu (`sm64_view.cpp`), GL overlay (`sm64_overlay.cpp`), 44.1 kHz audio (`sm64_audio.cpp`).
+          - `Makefile` `TARGET_SYMBIAN=1` is only used by the host pass (fake compiler, little-endian/32-bit asset generators).
+
+          ## Controls
+          Touch: floating stick (left), A/B bottom-right, C buttons, Z/L/R, START, MENU (top centre).
+          Keys: arrows = stick, X/Space/Centre = A, C/Backspace = B, Z = Z, Enter = Start, Q/W = L/R, T/G/F/H = C-up/down/left/right, left soft key = menu.
+          Menu: sound, pad, floating stick, mirror, opacity, size, frameskip, FPS, exit. Settings: `<drive>:\sm64\touch_settings.cfg`.
+
+          ## Files
+          `<drive>:\sm64\` holds `sm64.log` (+ `sm64_prev.log`), settings and the save file.
+
+          ## Notes / limits
+          - Not verified on hardware or in the SDK here: no ROM and no Symbian toolchain were available when this was written. Only the portable C was syntax-checked on a host. Expect to iterate from `sm64.log`.
+          - If the app dies at start, rerun with `fpu = softvfp`.
+          - ARM11 at ~680 MHz will not hold 30 fps everywhere; auto frameskip (menu) keeps logic speed. Turning sound off helps.
+          - Config options of the PC menu that need SDL are unavailable.
+          EOF_SM64
+          mkdir -p "$(dirname symbian/app/data/sm64.rss)"
+          cat > symbian/app/data/sm64.rss <<'EOF_SM64'
+          NAME SM64
+
+          #include <eikon.rh>
+          #include <avkon.rh>
+          #include <avkon.rsg>
+          #include <appinfo.rh>
+
+          RESOURCE RSS_SIGNATURE { }
+
+          RESOURCE TBUF r_default_document_name { buf = ""; }
+
+          RESOURCE EIK_APP_INFO
+              {
+              }
+
+          RESOURCE LOCALISABLE_APP_INFO r_localisable_app_info
+              {
+              short_caption = "SM64";
+              caption_and_icon = CAPTION_AND_ICON_INFO
+                  {
+                  caption = "Super Mario 64";
+                  number_of_icons = 0;
+                  };
+              }
+          EOF_SM64
+          mkdir -p "$(dirname symbian/app/data/sm64_reg.rss)"
+          cat > symbian/app/data/sm64_reg.rss <<'EOF_SM64'
+          #include <appinfo.rh>
+          #include <sm64.rsg>
+
+          UID2 KUidAppRegistrationResourceFile
+          UID3 0xE5A64D64
+
+          RESOURCE APP_REGISTRATION_INFO
+              {
+              app_file = "sm64";
+              localisable_resource_file = "\\resource\\apps\\sm64";
+              localisable_resource_id = R_LOCALISABLE_APP_INFO;
+              embeddability = KAppNotEmbeddable;
+              newfile = KAppDoesNotSupportNewFile;
+              }
+          EOF_SM64
+          mkdir -p "$(dirname symbian/app/group/bld.inf)"
+          cat > symbian/app/group/bld.inf <<'EOF_SM64'
+          PRJ_PLATFORMS
+          DEFAULT
+
+          PRJ_MMPFILES
+          sm64.mmp
+          EOF_SM64
+          mkdir -p "$(dirname symbian/app/group/sm64.mmp.in)"
+          cat > symbian/app/group/sm64.mmp.in <<'EOF_SM64'
+          // Super Mario 64 (sm64ex) for Symbian^3 / Open C / OpenGL ES 2.0.
+          // sm64.mmp is generated from this file by symbian/tools/prepare_symbian.py.
+          #include <platform_paths.hrh>
+
+          TARGET          sm64.exe
+          TARGETTYPE      exe
+          UID             0x100039CE 0xE5A64D64
+          SECUREID        0xE5A64D64
+          VENDORID        0
+          CAPABILITY      NONE
+
+          EPOCSTACKSIZE   0x100000
+          EPOCHEAPSIZE    0x800000 0x6000000
+
+          MACRO           NDEBUG
+          MACRO           Z3_MULTITOUCH
+          MACRO           TARGET_SYMBIAN
+          MACRO           USE_GLES
+          MACRO           RAPI_GL=1
+          MACRO           WAPI_SYMBIAN=1
+          MACRO           AAPI_SYMBIAN=1
+          MACRO           CAPI_SYMBIAN=1
+          MACRO           NO_BZERO_BCOPY
+          MACRO           EXT_OPTIONS_MENU
+
+          SOURCEPATH      ../src
+          SOURCE          sm64_app.cpp
+          SOURCE          sm64_appui.cpp
+          SOURCE          sm64_view.cpp
+          SOURCE          sm64_overlay.cpp
+          SOURCE          sm64_gl.cpp
+          SOURCE          sm64_audio.cpp
+
+          @GAME_SOURCES@
+
+          USERINCLUDE     ../inc
+          @USERINCLUDES@
+          SYSTEMINCLUDE   /epoc32/include/stdapis
+          APP_LAYER_SYSTEMINCLUDE
+
+          SOURCEPATH      ../data
+          START RESOURCE  sm64.rss
+          HEADER
+          TARGETPATH      /resource/apps
+          END
+
+          START RESOURCE  sm64_reg.rss
+          TARGETPATH      /private/10003a3f/import/apps
+          END
+
+          LIBRARY         euser.lib apparc.lib cone.lib eikcore.lib avkon.lib eikcoctl.lib
+          LIBRARY         fbscli.lib bitgdi.lib gdi.lib ws32.lib efsrv.lib
+          LIBRARY         mediaclientaudiostream.lib bafl.lib
+          LIBRARY         libc.lib libm.lib
+          LIBRARY         libEGL.lib libGLESv2.lib
+
+          // ARM11: no unaligned accesses; the N64 code relies on wrapping signed arithmetic and signed char.
+          OPTION          GCCE @OPT@ @FPU@ -fsigned-char -fno-strict-aliasing -fwrapv -mno-unaligned-access -w
+          OPTION          GCCE -Wno-error=implicit-function-declaration -Wno-error=int-conversion
+          OPTION          GCCE -Wno-error=incompatible-pointer-types -Wno-error=implicit-int
+          OPTION          GCCE -idirafter @GCCINC@
+          EOF_SM64
+          mkdir -p "$(dirname symbian/app/inc/sm64_font.h)"
+          cat > symbian/app/inc/sm64_font.h <<'EOF_SM64'
+          /* generated: 128x72 1bpp font atlas, 16x6 cells of 8x12, ASCII 32..127 */
+          static const unsigned char kFontBits[16*72] = {
+            0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+            0x00,0x00,0x00,0x00,0x10,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+            0x00,0x00,0x00,0x28,0x3C,0x70,0x00,0x18,0x08,0x20,0x10,0x00,0x00,0x00,0x00,0x04,
+            0x00,0x30,0x28,0x28,0x64,0x54,0x38,0x10,0x10,0x10,0x78,0x10,0x00,0x00,0x00,0x04,
+            0x00,0x30,0x28,0x7C,0x78,0x78,0x60,0x20,0x30,0x18,0x30,0x10,0x00,0x00,0x00,0x08,
+            0x00,0x30,0x28,0x28,0x3C,0x10,0x30,0x00,0x30,0x18,0x48,0x7C,0x00,0x7C,0x00,0x08,
+            0x00,0x30,0x00,0x28,0x0C,0x3C,0x7C,0x00,0x30,0x18,0x00,0x10,0x00,0x00,0x00,0x10,
+            0x00,0x00,0x00,0x7C,0x6C,0x54,0x58,0x00,0x30,0x18,0x00,0x10,0x00,0x00,0x00,0x10,
+            0x00,0x30,0x00,0x28,0x78,0x1C,0x7C,0x00,0x10,0x10,0x00,0x00,0x18,0x00,0x30,0x20,
+            0x00,0x00,0x00,0x28,0x10,0x00,0x00,0x00,0x08,0x20,0x00,0x00,0x10,0x00,0x00,0x20,
+            0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x20,0x00,0x00,0x00,
+            0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+            0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+            0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+            0x38,0x18,0x38,0x38,0x0C,0x7C,0x38,0x7C,0x38,0x38,0x00,0x00,0x00,0x00,0x00,0x00,
+            0x6C,0x78,0x6C,0x6C,0x1C,0x60,0x6C,0x6C,0x6C,0x6C,0x00,0x00,0x18,0x00,0x30,0x38,
+            0x6C,0x18,0x0C,0x0C,0x2C,0x78,0x60,0x0C,0x6C,0x6C,0x00,0x00,0x30,0x78,0x18,0x4C,
+            0x6C,0x18,0x18,0x38,0x6C,0x6C,0x78,0x18,0x38,0x3C,0x30,0x30,0x60,0x00,0x0C,0x18,
+            0x6C,0x18,0x30,0x0C,0x7E,0x0C,0x6C,0x18,0x6C,0x0C,0x00,0x00,0x30,0x78,0x18,0x30,
+            0x6C,0x18,0x6C,0x6C,0x0C,0x4C,0x6C,0x30,0x6C,0x6C,0x00,0x00,0x18,0x00,0x30,0x00,
+            0x38,0x7E,0x7C,0x38,0x0C,0x78,0x38,0x30,0x38,0x38,0x30,0x30,0x00,0x00,0x00,0x30,
+            0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x20,0x00,0x00,0x00,0x00,
+            0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x40,0x00,0x00,0x00,0x00,
+            0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+            0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+            0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+            0x38,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+            0x64,0x78,0x78,0x3C,0x78,0x7C,0x7C,0x38,0x6E,0x78,0x3C,0x6C,0x70,0x44,0x6E,0x38,
+            0x4C,0x38,0x6C,0x6C,0x6C,0x60,0x60,0x6C,0x6C,0x30,0x18,0x68,0x60,0x6C,0x74,0x6C,
+            0x54,0x28,0x78,0x60,0x6C,0x78,0x78,0x60,0x7C,0x30,0x18,0x70,0x60,0x6C,0x74,0x6C,
+            0x54,0x7C,0x6C,0x60,0x6C,0x60,0x60,0x7C,0x6C,0x30,0x58,0x78,0x60,0x7C,0x6C,0x6C,
+            0x4E,0x6C,0x6C,0x6C,0x6C,0x6C,0x60,0x6C,0x6C,0x30,0x58,0x6C,0x6C,0x54,0x6C,0x6C,
+            0x60,0x6E,0x78,0x38,0x78,0x7C,0x70,0x3C,0x6E,0x78,0x70,0x76,0x7C,0x54,0x64,0x38,
+            0x38,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+            0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+            0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+            0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+            0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+            0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x38,0x40,0x38,0x10,0x00,
+            0x78,0x38,0x78,0x3C,0x7C,0x6E,0x6E,0x56,0x66,0x66,0x7C,0x30,0x40,0x18,0x38,0x00,
+            0x6C,0x6C,0x6C,0x64,0x34,0x6C,0x6C,0x54,0x3C,0x66,0x6C,0x30,0x20,0x18,0x6C,0x00,
+            0x6C,0x6C,0x6C,0x78,0x30,0x6C,0x28,0x54,0x18,0x3C,0x18,0x30,0x20,0x18,0x00,0x00,
+            0x78,0x6C,0x78,0x1C,0x30,0x6C,0x38,0x7C,0x18,0x18,0x30,0x30,0x10,0x18,0x00,0x00,
+            0x60,0x6C,0x6C,0x4C,0x30,0x6C,0x38,0x38,0x3C,0x18,0x6C,0x30,0x10,0x18,0x00,0x00,
+            0x70,0x38,0x76,0x78,0x78,0x38,0x10,0x28,0x66,0x3C,0x7C,0x30,0x08,0x18,0x00,0x00,
+            0x00,0x0C,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x38,0x08,0x38,0x00,0x00,
+            0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x7E,
+            0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+            0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+            0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+            0x30,0x00,0x60,0x00,0x1C,0x00,0x1C,0x00,0x60,0x18,0x18,0x60,0x78,0x00,0x00,0x00,
+            0x10,0x00,0x60,0x00,0x0C,0x00,0x30,0x00,0x60,0x00,0x00,0x60,0x18,0x00,0x00,0x00,
+            0x08,0x38,0x78,0x38,0x3C,0x38,0x7C,0x36,0x78,0x78,0x78,0x6C,0x18,0x78,0x58,0x38,
+            0x00,0x6C,0x6C,0x6C,0x6C,0x6C,0x30,0x6C,0x6C,0x18,0x18,0x78,0x18,0x7C,0x6C,0x6C,
+            0x00,0x3C,0x6C,0x60,0x6C,0x7C,0x30,0x6C,0x6C,0x18,0x18,0x70,0x18,0x54,0x6C,0x6C,
+            0x00,0x6C,0x6C,0x6C,0x6C,0x60,0x30,0x6C,0x6C,0x18,0x18,0x78,0x18,0x54,0x6C,0x6C,
+            0x00,0x7E,0x78,0x38,0x3E,0x3C,0x7C,0x3C,0x6C,0x7E,0x18,0x6E,0x7E,0x54,0x6C,0x38,
+            0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x0C,0x00,0x00,0x18,0x00,0x00,0x00,0x00,0x00,
+            0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x78,0x00,0x00,0x70,0x00,0x00,0x00,0x00,0x00,
+            0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+            0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+            0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+            0x00,0x00,0x00,0x00,0x30,0x00,0x00,0x00,0x00,0x00,0x00,0x0C,0x00,0x60,0x00,0x00,
+            0x00,0x00,0x00,0x00,0x30,0x00,0x00,0x00,0x00,0x00,0x00,0x18,0x10,0x30,0x00,0x00,
+            0x78,0x36,0x6E,0x3C,0x7C,0x6C,0x6C,0x56,0x76,0x6E,0x7C,0x18,0x10,0x30,0x34,0x00,
+            0x6C,0x6C,0x3A,0x70,0x30,0x6C,0x6C,0x54,0x3C,0x6C,0x58,0x30,0x10,0x18,0x58,0x00,
+            0x6C,0x6C,0x30,0x3C,0x30,0x6C,0x38,0x7C,0x18,0x6C,0x30,0x18,0x10,0x30,0x00,0x00,
+            0x6C,0x6C,0x30,0x0E,0x36,0x6C,0x38,0x3C,0x3C,0x28,0x6C,0x18,0x10,0x30,0x00,0x00,
+            0x78,0x3C,0x78,0x7C,0x1C,0x3E,0x10,0x28,0x6E,0x38,0x7C,0x18,0x10,0x30,0x00,0x00,
+            0x60,0x0C,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x30,0x00,0x0C,0x10,0x60,0x00,0x00,
+            0x70,0x1E,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x60,0x00,0x00,0x00,0x00,0x00,0x00,
+            0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+          };
+          EOF_SM64
+          mkdir -p "$(dirname symbian/app/inc/sm64app.h)"
+          cat > symbian/app/inc/sm64app.h <<'EOF_SM64'
+          // sm64app.h - Symbian^3 front end for the Super Mario 64 (sm64ex) port.
+          // Everything (UI, EGL, game, audio callbacks) runs on the UI thread.
+          #ifndef SM64APP_SYMBIAN_H
+          #define SM64APP_SYMBIAN_H
+
+          #include <aknapp.h>
+          #include <akndoc.h>
+          #include <aknappui.h>
+          #include <coecntrl.h>
+          #include <e32base.h>
+          #include <f32file.h>
+          #include <mdaaudiooutputstream.h>
+
+          #include "sym_host.h"
+
+          const TUid KUidSm64 = { (TInt32)0xE5A64D64 };
+
+          // ---------------------------------------------------------------------------
+          // GL overlay (touch pad, menu, fps): own tiny shader, saves/restores all game GL state.
+          // ---------------------------------------------------------------------------
+          namespace Ovl
+              {
+              TBool Init();
+              void Release();
+              void Begin(TInt aW, TInt aH);
+              void Quad(TReal32 aX0, TReal32 aY0, TReal32 aX1, TReal32 aY1, TUint32 aRgba);
+              void Circle(TReal32 aCx, TReal32 aCy, TReal32 aR, TUint32 aRgba);
+              void Text(TReal32 aX, TReal32 aY, TReal32 aScale, const char* aStr, TUint32 aRgba);
+              TReal32 TextWidth(const char* aStr, TReal32 aScale);
+              void End();
+              }
+
+          #define OVL_RGBA(r, g, b, a) ((((TUint32)(a)) << 24) | (((TUint32)(b)) << 16) | (((TUint32)(g)) << 8) | ((TUint32)(r)))
+
+          // Pulls PCM from the game's ring buffer into a CMdaAudioOutputStream (44.1 kHz stereo).
+          class CSm64Audio : public CBase, public MMdaAudioOutputStreamCallback
+              {
+          public:
+              static CSm64Audio* NewL();
+              ~CSm64Audio();
+              void Suspend();
+              void Resume();
+
+              void MaoscOpenComplete(TInt aError);
+              void MaoscBufferCopied(TInt aError, const TDesC8& aBuffer);
+              void MaoscPlayComplete(TInt aError);
+
+          private:
+              CSm64Audio();
+              void OpenStream();
+              void Fill(TInt aSlot);
+
+              enum { KSlots = 4, KFrames = 1024, KBytes = 1024 * 4 };
+              CMdaAudioOutputStream* iStream;
+              TBool iReady;
+              TBool iSuspended;
+              TUint8 iBuf[KSlots][KBytes];
+              TPtrC8 iDes[KSlots];
+              };
+
+          // Full-screen window owning the EGL window surface.
+          class CSm64GlView : public CCoeControl
+              {
+          public:
+              static CSm64GlView* NewL(const TRect& aRect);
+              void Draw(const TRect& aRect) const;
+              RWindow& GlWindow() { return Window(); }
+              void SetChild(CCoeControl* aChild) { iChild = aChild; }
+              TInt CountComponentControls() const { return iChild ? 1 : 0; }
+              CCoeControl* ComponentControl(TInt /*aIndex*/) const { return iChild; }
+          private:
+              CCoeControl* iChild;
+              };
+
+          struct TSm64Btn
+              {
+              TInt iCircle;       // 1 = circle (iCx/iCy/iR), 0 = rectangle (iRect)
+              TInt iCx, iCy, iR;
+              TRect iRect;
+              TUint iMask;        // N64 button bits, or KMenuMask
+              const char* iLabel;
+              };
+
+          // Window-less control inside the GL view: loading/error text (gc), touch pad + menu (GL), keys.
+          class CSm64Container : public CCoeControl
+              {
+          public:
+              static CSm64Container* NewL(const TRect& aRect, CSm64GlView* aView);
+              ~CSm64Container();
+              void SetForeground(TBool aForeground);
+
+              void Draw(const TRect& aRect) const;
+              void SizeChanged();
+              void HandlePointerEventL(const TPointerEvent& aEvent);
+              TKeyResponse OfferKeyEventL(const TKeyEvent& aKeyEvent, TEventCode aType);
+
+              void DrawOverlay(TInt aW, TInt aH);
+
+          private:
+              enum TMode { ELoading, EPlay, EMenu, EError };
+              enum { KMaxPtrs = 5, KBtns = 11, KMenuItems = 10 };
+              enum { KMenuMask = 0x10000 };
+
+              CSm64Container();
+              void ConstructL(const TRect& aRect, CSm64GlView* aView);
+
+              static TInt TickCb(TAny* aPtr);
+              static TInt InitCb(TAny* aPtr);
+              void Tick();
+              void DoInit();
+              void StartTimer();
+              void StopTimer();
+              TBool FindUserDir(TDes8& aPath);
+              void SetError(const TDesC8& aText);
+              void GlStatusScreen(const char* aL1, const char* aL2);
+              void Quit();
+              void OpenMenu();
+              void CloseMenu();
+              void MenuAction(TInt aIndex);
+              void MenuLabel(TInt aIndex, TBuf8<48>& aOut) const;
+              void MenuFrame();
+              void MenuGeom(TInt& aX, TInt& aY, TInt& aW, TInt& aRow, TInt& aScale) const;
+              TInt MenuRowAt(const TPoint& aPt) const;
+              void ComputeLayout(TInt aW, TInt aH);
+              TBool OnButton(const TSm64Btn& aB, const TPoint& aPt) const;
+              void UpdateTouch();
+              void PushInput();
+              void ReleaseAll();
+
+              CSm64GlView* iView;
+              CPeriodic* iTimer;
+              CIdle* iIdle;
+              CSm64Audio* iAudio;
+              RFs iFs;
+
+              TMode iMode;
+              TBool iForeground;
+              TBool iGlUp;
+              TBool iStarted;
+              TInt iGlW, iGlH;
+              TInt iLayW, iLayH;
+              TInt64 iNextDue;
+              TInt iSkipRun;
+
+              TBuf8<160> iErrLine1;
+              TBuf8<160> iErrLine2;
+
+              TUint iKeyBits;
+              TUint iKeyDirs;          // 1 up, 2 down, 4 left, 8 right
+              TBool iPtrDown[KMaxPtrs];
+              TPoint iPtrPos[KMaxPtrs];
+              TInt iStickPtr;
+              TPoint iStickO;
+              TPoint iStickCur;
+              TPoint iStickFixed;
+              TInt iStickR;
+              TUint iTouchBits;
+              TInt iTouchSx, iTouchSy;
+
+              TSm64Btn iBtn[KBtns];
+              TReal32 iUnit;
+              TInt iMenuSel;
+              };
+
+          class CSm64AppUi : public CAknAppUi
+              {
+          public:
+              void ConstructL();
+              ~CSm64AppUi();
+              void HandleCommandL(TInt aCommand);
+              void HandleForegroundEventL(TBool aForeground);
+              void HandleResourceChangeL(TInt aType);
+          private:
+              CSm64GlView* iView;
+              CSm64Container* iContainer;
+              };
+
+          class CSm64Document : public CAknDocument
+              {
+          public:
+              CSm64Document(CEikApplication& aApp) : CAknDocument(aApp) {}
+          private:
+              CEikAppUi* CreateAppUiL();
+              };
+
+          class CSm64Application : public CAknApplication
+              {
+          private:
+              CApaDocument* CreateDocumentL();
+              TUid AppDllUid() const;
+              };
+
+          #endif
+          EOF_SM64
+          mkdir -p "$(dirname symbian/app/sis/readme.txt)"
+          cat > symbian/app/sis/readme.txt <<'EOF_SM64'
+          Super Mario 64 (sm64ex) - Symbian^3 port.
+          All game data is already inside the app (extracted from your own ROM at build time).
+          This folder holds sm64.log (diagnostics), sm64_prev.log, touch_settings.cfg and the save file.
+          EOF_SM64
+          mkdir -p "$(dirname symbian/app/sis/sm64.pkg)"
+          cat > symbian/app/sis/sm64.pkg <<'EOF_SM64'
+          ; Super Mario 64 (sm64ex) for Symbian^3 - paths are expanded by package-sis.sh
+          &EN
+          #{"Super Mario 64"},(0xE5A64D64),1,0,0
+
+          %{"SM64 Symbian port"}
+          :"Symbian port"
+
+          [0x20022E6D], 0, 0, 0, {"S60ProductID"}
+          [0x1028315F], 0, 0, 0, {"S60ProductID"}
+          [0x102752AE], 0, 0, 0, {"S60ProductID"}
+          [0x102032BE], 0, 0, 0, {"S60ProductID"}
+          [0x101F7961], 0, 0, 0, {"S60ProductID"}
+
+          "$(epocroot)epoc32/release/$(platform)/$(target)/sm64.exe"-"!:\sys\bin\sm64.exe"
+          "$(epocroot)epoc32/data/z/resource/apps/sm64.rsc"-"!:\resource\apps\sm64.rsc"
+          "$(epocroot)epoc32/data/z/private/10003a3f/import/apps/sm64_reg.rsc"-"!:\private\10003a3f\import\apps\sm64_reg.rsc"
+          "readme.txt"-"!:\sm64\readme.txt"
+          EOF_SM64
+          mkdir -p "$(dirname symbian/app/src/sm64_app.cpp)"
+          cat > symbian/app/src/sm64_app.cpp <<'EOF_SM64'
+          #include <eikstart.h>
+          #include "sm64app.h"
+
+          CApaDocument* CSm64Application::CreateDocumentL() { return new (ELeave) CSm64Document(*this); }
+          TUid CSm64Application::AppDllUid() const { return KUidSm64; }
+          CEikAppUi* CSm64Document::CreateAppUiL() { return new (ELeave) CSm64AppUi; }
+
+          LOCAL_C CApaApplication* NewApplication() { return new CSm64Application; }
+
+          GLDEF_C TInt E32Main() { return EikStart::RunApplication(NewApplication); }
+          EOF_SM64
+          mkdir -p "$(dirname symbian/app/src/sm64_appui.cpp)"
+          cat > symbian/app/src/sm64_appui.cpp <<'EOF_SM64'
+          #include <avkon.hrh>
+          #include <eikon.hrh>
+          #include <eikenv.h>
+          #include <eikspane.h>
+          #include <eikbtgpc.h>
+          #include "sm64app.h"
+
+          void CSm64AppUi::ConstructL()
+              {
+              BaseConstructL(CAknAppUi::EAknEnableSkin);
+              SetOrientationL(CAknAppUiBase::EAppUiOrientationLandscape);
+
+              CEikStatusPane* sp = StatusPane();
+              if (sp) sp->MakeVisible(EFalse);
+              CEikButtonGroupContainer* cba = Cba();
+              if (cba) cba->MakeVisible(EFalse);
+
+              iView = CSm64GlView::NewL(ApplicationRect());
+              iContainer = CSm64Container::NewL(ApplicationRect(), iView);
+              iView->SetChild(iContainer);
+              AddToStackL(iContainer);
+              }
+
+          CSm64AppUi::~CSm64AppUi()
+              {
+              if (iContainer)
+                  {
+                  RemoveFromStack(iContainer);
+                  delete iContainer;
+                  iContainer = NULL;
+                  }
+              delete iView;
+              iView = NULL;
+              }
+
+          void CSm64AppUi::HandleCommandL(TInt aCommand)
+              {
+              switch (aCommand)
+                  {
+                  case EEikCmdExit:
+                  case EAknSoftkeyExit:
+                  case EAknCmdExit:
+                      Exit();
+                      break;
+                  default:
+                      break;
+                  }
+              }
+
+          void CSm64AppUi::HandleForegroundEventL(TBool aForeground)
+              {
+              CAknAppUi::HandleForegroundEventL(aForeground);
+              if (iContainer) iContainer->SetForeground(aForeground);
+              }
+
+          void CSm64AppUi::HandleResourceChangeL(TInt aType)
+              {
+              CAknAppUi::HandleResourceChangeL(aType);
+              if (iContainer && aType == KEikDynamicLayoutVariantSwitch)
+                  {
+                  iView->SetRect(ApplicationRect());
+                  iContainer->SetRect(ApplicationRect());
+                  }
+              }
+          EOF_SM64
+          mkdir -p "$(dirname symbian/app/src/sm64_audio.cpp)"
+          cat > symbian/app/src/sm64_audio.cpp <<'EOF_SM64'
+          // CMdaAudioOutputStream, 44.1 kHz stereo PCM16, pulled from the game's ring buffer (UI thread).
+          #include "sm64app.h"
+
+          static const TInt KRate44100 = 0x00000020;   // TMdaAudioDataSettings::ESampleRate44100Hz
+          static const TInt KStereo = 0x00000002;      // TMdaAudioDataSettings::EChannelsStereo
+
+          CSm64Audio* CSm64Audio::NewL()
+              {
+              CSm64Audio* self = new (ELeave) CSm64Audio;
+              self->OpenStream();
+              return self;
+              }
+
+          CSm64Audio::CSm64Audio()
+              {
+              for (TInt i = 0; i < KSlots; ++i)
+                  {
+                  Mem::FillZ(iBuf[i], KBytes);
+                  iDes[i].Set(iBuf[i], KBytes);
+                  }
+              }
+
+          CSm64Audio::~CSm64Audio()
+              {
+              if (iStream)
+                  {
+                  iStream->Stop();
+                  delete iStream;
+                  }
+              }
+
+          void CSm64Audio::OpenStream()
+              {
+              iReady = EFalse;
+              delete iStream;
+              iStream = NULL;
+              TRAPD(err, iStream = CMdaAudioOutputStream::NewL(*this));
+              if (err == KErrNone && iStream) iStream->Open(NULL);
+              }
+
+          void CSm64Audio::Fill(TInt aSlot)
+              {
+              Sym_AudioPull((short*)iBuf[aSlot], KFrames);
+              TRAPD(err, iStream->WriteL(iDes[aSlot]));
+              (void)err;
+              }
+
+          void CSm64Audio::MaoscOpenComplete(TInt aError)
+              {
+              if (aError != KErrNone)
+                  {
+                  sym_log("[AUD] open failed %d", (int)aError);
+                  return;
+                  }
+              TRAPD(err, iStream->SetAudioPropertiesL(KRate44100, KStereo));
+              if (err != KErrNone)
+                  {
+                  sym_log("[AUD] SetAudioPropertiesL failed %d", (int)err);
+                  return;
+                  }
+              iStream->SetVolume(iStream->MaxVolume() / 2);
+              iStream->SetPriority(EPriorityNormal, EMdaPriorityPreferenceTime);
+              iReady = ETrue;
+              sym_log("[AUD] stream ready");
+              for (TInt i = 0; i < KSlots; ++i) Fill(i);
+              }
+
+          void CSm64Audio::MaoscBufferCopied(TInt aError, const TDesC8& aBuffer)
+              {
+              if (aError != KErrNone || !iReady || iSuspended) return;
+              for (TInt i = 0; i < KSlots; ++i)
+                  {
+                  if (iBuf[i] == aBuffer.Ptr())
+                      {
+                      Fill(i);
+                      return;
+                      }
+                  }
+              }
+
+          void CSm64Audio::MaoscPlayComplete(TInt /*aError*/) {}
+
+          void CSm64Audio::Suspend()
+              {
+              iSuspended = ETrue;
+              if (iStream && iReady)
+                  {
+                  iStream->Stop();
+                  iReady = EFalse;
+                  }
+              }
+
+          void CSm64Audio::Resume()
+              {
+              if (iSuspended)
+                  {
+                  iSuspended = EFalse;
+                  OpenStream();
+                  }
+              }
+          EOF_SM64
+          mkdir -p "$(dirname symbian/app/src/sm64_gl.cpp)"
+          cat > symbian/app/src/sm64_gl.cpp <<'EOF_SM64'
+          // EGL / OpenGL ES 2.0 host. Single context, window surface, UI thread only (VideoCore III hangs otherwise).
+          #include <e32std.h>
+          #include <w32std.h>
+          #include <EGL/egl.h>
+          #include "sym_host.h"
+
+          static EGLDisplay gDpy = EGL_NO_DISPLAY;
+          static EGLSurface gSurf = EGL_NO_SURFACE;
+          static EGLContext gCtx = EGL_NO_CONTEXT;
+          static EGLConfig gCfg;
+          static int gW = 640, gH = 360;
+          static int gUp = 0;
+
+          static EGLBoolean Choose(const EGLint* aAttr, EGLConfig* aOut)
+              {
+              EGLint n = 0;
+              return eglChooseConfig(gDpy, aAttr, aOut, 1, &n) && n > 0;
+              }
+
+          static void LogCfg(EGLConfig c)
+              {
+              EGLint id = 0, r = 0, g = 0, b = 0, a = 0, d = 0, st = 0;
+              eglGetConfigAttrib(gDpy, c, EGL_CONFIG_ID, &id);
+              eglGetConfigAttrib(gDpy, c, EGL_RED_SIZE, &r);   eglGetConfigAttrib(gDpy, c, EGL_GREEN_SIZE, &g);
+              eglGetConfigAttrib(gDpy, c, EGL_BLUE_SIZE, &b);  eglGetConfigAttrib(gDpy, c, EGL_ALPHA_SIZE, &a);
+              eglGetConfigAttrib(gDpy, c, EGL_DEPTH_SIZE, &d); eglGetConfigAttrib(gDpy, c, EGL_STENCIL_SIZE, &st);
+              sym_log("[EGL] config id=%d rgba=%d/%d/%d/%d depth=%d stencil=%d", (int)id, (int)r, (int)g, (int)b, (int)a, (int)d, (int)st);
+              }
+
+          extern "C" const char* Sym_GlInit(void* aWindow)
+              {
+              gDpy = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+              if (gDpy == EGL_NO_DISPLAY) return "EGL: no display";
+              EGLint maj = 0, min = 0;
+              if (!eglInitialize(gDpy, &maj, &min)) return "EGL: eglInitialize failed";
+              {
+                  const char* ev = eglQueryString(gDpy, EGL_VENDOR);
+                  const char* evr = eglQueryString(gDpy, EGL_VERSION);
+                  sym_log("[EGL] %d.%d vendor=%s version=%s", (int)maj, (int)min, ev ? ev : "?", evr ? evr : "?");
+              }
+              eglBindAPI(EGL_OPENGL_ES_API);
+
+              // depth buffer is mandatory (SM64 uses z-buffering); prefer 16-bit colour for fill rate.
+              const EGLint a565d16[] = { EGL_SURFACE_TYPE, EGL_WINDOW_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+                                         EGL_RED_SIZE, 5, EGL_GREEN_SIZE, 6, EGL_BLUE_SIZE, 5, EGL_DEPTH_SIZE, 16, EGL_NONE };
+              const EGLint a565d[]   = { EGL_SURFACE_TYPE, EGL_WINDOW_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+                                         EGL_RED_SIZE, 5, EGL_GREEN_SIZE, 6, EGL_BLUE_SIZE, 5, EGL_DEPTH_SIZE, 1, EGL_NONE };
+              const EGLint aAnyd16[] = { EGL_SURFACE_TYPE, EGL_WINDOW_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+                                         EGL_DEPTH_SIZE, 16, EGL_NONE };
+              const EGLint aAnyd[]   = { EGL_SURFACE_TYPE, EGL_WINDOW_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+                                         EGL_DEPTH_SIZE, 1, EGL_NONE };
+              if (!(Choose(a565d16, &gCfg) || Choose(a565d, &gCfg) || Choose(aAnyd16, &gCfg) || Choose(aAnyd, &gCfg)))
+                  return "EGL: no ES 2.0 window config with a depth buffer";
+              LogCfg(gCfg);
+
+              gSurf = eglCreateWindowSurface(gDpy, gCfg, (EGLNativeWindowType)aWindow, NULL);
+              if (gSurf == EGL_NO_SURFACE)
+                  {
+                  sym_log("[EGL] eglCreateWindowSurface failed: 0x%x", (unsigned)eglGetError());
+                  return "EGL: eglCreateWindowSurface failed";
+                  }
+              const EGLint ctxAttr[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
+              gCtx = eglCreateContext(gDpy, gCfg, EGL_NO_CONTEXT, ctxAttr);
+              if (gCtx == EGL_NO_CONTEXT) return "EGL: eglCreateContext (ES 2.0) failed";
+              if (!eglMakeCurrent(gDpy, gSurf, gSurf, gCtx))
+                  {
+                  sym_log("[EGL] eglMakeCurrent failed: 0x%x", (unsigned)eglGetError());
+                  return "EGL: eglMakeCurrent failed";
+                  }
+              eglQuerySurface(gDpy, gSurf, EGL_WIDTH, &gW);
+              eglQuerySurface(gDpy, gSurf, EGL_HEIGHT, &gH);
+              eglSwapInterval(gDpy, 0);
+              sym_log("[EGL] ready, surface %dx%d", (int)gW, (int)gH);
+              gUp = 1;
+              return NULL;
+              }
+
+          extern "C" void Sym_GlShutdown(void)
+              {
+              if (gDpy == EGL_NO_DISPLAY) return;
+              gUp = 0;
+              eglMakeCurrent(gDpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+              if (gCtx != EGL_NO_CONTEXT) eglDestroyContext(gDpy, gCtx);
+              if (gSurf != EGL_NO_SURFACE) eglDestroySurface(gDpy, gSurf);
+              eglTerminate(gDpy);
+              gCtx = EGL_NO_CONTEXT;
+              gSurf = EGL_NO_SURFACE;
+              gDpy = EGL_NO_DISPLAY;
+              }
+
+          extern "C" void Sym_GlSize(int* w, int* h)
+              {
+              *w = gW;
+              *h = gH;
+              }
+
+          extern "C" int Sym_GlSwap(void)
+              {
+              if (!gUp) return 0;
+              if (!eglSwapBuffers(gDpy, gSurf))
+                  {
+                  static int logged;
+                  if (logged++ < 8) sym_log("[EGL] eglSwapBuffers failed: 0x%x", (unsigned)eglGetError());
+                  return 0;
+                  }
+              return 1;
+              }
+          EOF_SM64
+          mkdir -p "$(dirname symbian/app/src/sm64_overlay.cpp)"
+          cat > symbian/app/src/sm64_overlay.cpp <<'EOF_SM64'
+          // GL overlay renderer. Own program + font texture; saves and restores every piece of GL state the game's
+          // renderer (gfx_opengl.c) relies on, so the game never notices.
+          #include <e32std.h>
+          #include <e32math.h>
+          #include <GLES2/gl2.h>
+          #include "sm64app.h"
+          #include "sm64_font.h"
+
+          namespace
+          {
+          const int KMaxVerts = 6 * 700;
+          const int KTexW = 128, KTexH = 76;   // 72 rows of glyphs + 4 solid rows
+          struct Vtx { float x, y, u, v; TUint32 c; };
+
+          GLuint gProg = 0, gTex = 0;
+          GLint gLocScr = -1, gLocTex = -1;
+          Vtx gV[KMaxVerts];
+          int gN = 0;
+          int gW = 1, gH = 1;
+          float gSolidU = 0, gSolidV = 0;
+
+          // saved state
+          GLint sProg, sArr, sElem, sActive, sTex0, sBlendSrcC, sBlendDstC, sBlendSrcA, sBlendDstA, sBlendEqC, sBlendEqA;
+          GLint sVp[4];
+          GLboolean sBlend, sDepth, sCull, sScissor, sDMask, sCMask[4];
+          GLint sAttrEn[8];
+
+          GLuint Compile(GLenum aType, const char* aSrc)
+              {
+              GLuint s = glCreateShader(aType);
+              glShaderSource(s, 1, &aSrc, NULL);
+              glCompileShader(s);
+              GLint ok = 0;
+              glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+              if (!ok)
+                  {
+                  char log[256];
+                  GLsizei n = 0;
+                  glGetShaderInfoLog(s, sizeof log - 1, &n, log);
+                  log[n] = 0;
+                  sym_log("[OVL] shader error: %s", log);
+                  glDeleteShader(s);
+                  return 0;
+                  }
+              return s;
+              }
+
+          void Flush()
+              {
+              if (!gN) return;
+              glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(Vtx), &gV[0].x);
+              glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(Vtx), &gV[0].u);
+              glVertexAttribPointer(2, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(Vtx), &gV[0].c);
+              glDrawArrays(GL_TRIANGLES, 0, gN);
+              gN = 0;
+              }
+
+          void Tri(float x0, float y0, float u0, float v0, float x1, float y1, float u1, float v1,
+                   float x2, float y2, float u2, float v2, TUint32 c)
+              {
+              if (gN + 3 > KMaxVerts) Flush();
+              Vtx* p = &gV[gN];
+              p[0].x = x0; p[0].y = y0; p[0].u = u0; p[0].v = v0; p[0].c = c;
+              p[1].x = x1; p[1].y = y1; p[1].u = u1; p[1].v = v1; p[1].c = c;
+              p[2].x = x2; p[2].y = y2; p[2].u = u2; p[2].v = v2; p[2].c = c;
+              gN += 3;
+              }
+          }
+
+          TBool Ovl::Init()
+              {
+              if (gProg) return ETrue;
+              static const char* vs =
+                  "attribute vec2 aPos; attribute vec2 aUv; attribute vec4 aCol;\n"
+                  "uniform vec2 uScr; varying vec2 vUv; varying vec4 vCol;\n"
+                  "void main(){ vec2 p = aPos / uScr; gl_Position = vec4(p.x*2.0-1.0, 1.0-p.y*2.0, 0.0, 1.0); vUv = aUv; vCol = aCol; }\n";
+              static const char* fs =
+                  "precision mediump float; varying vec2 vUv; varying vec4 vCol; uniform sampler2D uTex;\n"
+                  "void main(){ gl_FragColor = vec4(vCol.rgb, vCol.a * texture2D(uTex, vUv).a); }\n";
+              GLuint v = Compile(GL_VERTEX_SHADER, vs);
+              GLuint f = Compile(GL_FRAGMENT_SHADER, fs);
+              if (!v || !f) return EFalse;
+              gProg = glCreateProgram();
+              glAttachShader(gProg, v);
+              glAttachShader(gProg, f);
+              glBindAttribLocation(gProg, 0, "aPos");
+              glBindAttribLocation(gProg, 1, "aUv");
+              glBindAttribLocation(gProg, 2, "aCol");
+              glLinkProgram(gProg);
+              GLint ok = 0;
+              glGetProgramiv(gProg, GL_LINK_STATUS, &ok);
+              glDeleteShader(v);
+              glDeleteShader(f);
+              if (!ok)
+                  {
+                  sym_log("[OVL] program link failed");
+                  glDeleteProgram(gProg);
+                  gProg = 0;
+                  return EFalse;
+                  }
+              gLocScr = glGetUniformLocation(gProg, "uScr");
+              gLocTex = glGetUniformLocation(gProg, "uTex");
+
+              static TUint8 px[KTexW * KTexH];
+              for (int y = 0; y < 72; ++y)
+                  for (int x = 0; x < 128; ++x)
+                      px[y * KTexW + x] = (kFontBits[y * 16 + (x >> 3)] & (0x80 >> (x & 7))) ? 255 : 0;
+              for (int y = 72; y < KTexH; ++y)
+                  for (int x = 0; x < KTexW; ++x) px[y * KTexW + x] = 255;
+              GLint prevTex = 0, prevAlign = 4;
+              glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevTex);
+              glGetIntegerv(GL_UNPACK_ALIGNMENT, &prevAlign);
+              glGenTextures(1, &gTex);
+              glBindTexture(GL_TEXTURE_2D, gTex);
+              glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+              glTexImage2D(GL_TEXTURE_2D, 0, GL_ALPHA, KTexW, KTexH, 0, GL_ALPHA, GL_UNSIGNED_BYTE, px);
+              glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+              glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+              glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+              glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+              glPixelStorei(GL_UNPACK_ALIGNMENT, prevAlign);
+              glBindTexture(GL_TEXTURE_2D, (GLuint)prevTex);
+              gSolidU = 4.0f / KTexW;
+              gSolidV = 74.0f / KTexH;
+              return ETrue;
+              }
+
+          void Ovl::Release()
+              {
+              if (gTex) { glDeleteTextures(1, &gTex); gTex = 0; }
+              if (gProg) { glDeleteProgram(gProg); gProg = 0; }
+              }
+
+          void Ovl::Begin(TInt aW, TInt aH)
+              {
+              if (!gProg) return;
+              gW = aW;
+              gH = aH;
+              gN = 0;
+              glGetIntegerv(GL_CURRENT_PROGRAM, &sProg);
+              glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &sArr);
+              glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &sElem);
+              glGetIntegerv(GL_ACTIVE_TEXTURE, &sActive);
+              glActiveTexture(GL_TEXTURE0);
+              glGetIntegerv(GL_TEXTURE_BINDING_2D, &sTex0);
+              glGetIntegerv(GL_VIEWPORT, sVp);
+              glGetIntegerv(GL_BLEND_SRC_RGB, &sBlendSrcC);
+              glGetIntegerv(GL_BLEND_DST_RGB, &sBlendDstC);
+              glGetIntegerv(GL_BLEND_SRC_ALPHA, &sBlendSrcA);
+              glGetIntegerv(GL_BLEND_DST_ALPHA, &sBlendDstA);
+              glGetIntegerv(GL_BLEND_EQUATION_RGB, &sBlendEqC);
+              glGetIntegerv(GL_BLEND_EQUATION_ALPHA, &sBlendEqA);
+              sBlend = glIsEnabled(GL_BLEND);
+              sDepth = glIsEnabled(GL_DEPTH_TEST);
+              sCull = glIsEnabled(GL_CULL_FACE);
+              sScissor = glIsEnabled(GL_SCISSOR_TEST);
+              glGetBooleanv(GL_DEPTH_WRITEMASK, &sDMask);
+              glGetBooleanv(GL_COLOR_WRITEMASK, sCMask);
+              for (int i = 0; i < 8; ++i) glGetVertexAttribiv(i, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &sAttrEn[i]);
+
+              glBindBuffer(GL_ARRAY_BUFFER, 0);
+              glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+              glViewport(0, 0, aW, aH);
+              glDisable(GL_DEPTH_TEST);
+              glDisable(GL_CULL_FACE);
+              glDisable(GL_SCISSOR_TEST);
+              glDepthMask(GL_FALSE);
+              glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+              glEnable(GL_BLEND);
+              glBlendEquation(GL_FUNC_ADD);
+              glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+              for (int i = 0; i < 8; ++i)
+                  {
+                  if (i < 3) glEnableVertexAttribArray(i);
+                  else glDisableVertexAttribArray(i);
+                  }
+              glUseProgram(gProg);
+              glUniform2f(gLocScr, (GLfloat)aW, (GLfloat)aH);
+              glUniform1i(gLocTex, 0);
+              glBindTexture(GL_TEXTURE_2D, gTex);
+              }
+
+          void Ovl::End()
+              {
+              if (!gProg) return;
+              Flush();
+              glUseProgram((GLuint)sProg);
+              glBindTexture(GL_TEXTURE_2D, (GLuint)sTex0);
+              glActiveTexture((GLenum)sActive);
+              glBindBuffer(GL_ARRAY_BUFFER, (GLuint)sArr);
+              glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, (GLuint)sElem);
+              glViewport(sVp[0], sVp[1], sVp[2], sVp[3]);
+              glBlendEquationSeparate((GLenum)sBlendEqC, (GLenum)sBlendEqA);
+              glBlendFuncSeparate((GLenum)sBlendSrcC, (GLenum)sBlendDstC, (GLenum)sBlendSrcA, (GLenum)sBlendDstA);
+              if (sBlend) glEnable(GL_BLEND); else glDisable(GL_BLEND);
+              if (sDepth) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
+              if (sCull) glEnable(GL_CULL_FACE); else glDisable(GL_CULL_FACE);
+              if (sScissor) glEnable(GL_SCISSOR_TEST); else glDisable(GL_SCISSOR_TEST);
+              glDepthMask(sDMask);
+              glColorMask(sCMask[0], sCMask[1], sCMask[2], sCMask[3]);
+              for (int i = 0; i < 8; ++i)
+                  {
+                  if (sAttrEn[i]) glEnableVertexAttribArray(i);
+                  else glDisableVertexAttribArray(i);
+                  }
+              }
+
+          void Ovl::Quad(TReal32 x0, TReal32 y0, TReal32 x1, TReal32 y1, TUint32 c)
+              {
+              if (!gProg) return;
+              float u = gSolidU, v = gSolidV;
+              Tri(x0, y0, u, v, x1, y0, u, v, x1, y1, u, v, c);
+              Tri(x0, y0, u, v, x1, y1, u, v, x0, y1, u, v, c);
+              }
+
+          void Ovl::Circle(TReal32 cx, TReal32 cy, TReal32 r, TUint32 c)
+              {
+              if (!gProg) return;
+              // 16-gon, precomputed unit circle
+              static const float ct[17] = { 1.0f, 0.92388f, 0.70711f, 0.38268f, 0.0f, -0.38268f, -0.70711f, -0.92388f, -1.0f,
+                                            -0.92388f, -0.70711f, -0.38268f, 0.0f, 0.38268f, 0.70711f, 0.92388f, 1.0f };
+              float u = gSolidU, v = gSolidV;
+              for (int i = 0; i < 16; ++i)
+                  {
+                  int j = i + 1;
+                  float ci = ct[i], si = ct[(i + 12) & 15];
+                  float cj = ct[j], sj = ct[(j + 12) & 15];
+                  Tri(cx, cy, u, v, cx + ci * r, cy + si * r, u, v, cx + cj * r, cy + sj * r, u, v, c);
+                  }
+              }
+
+          TReal32 Ovl::TextWidth(const char* s, TReal32 sc)
+              {
+              TInt n = 0;
+              while (*s++) ++n;
+              return n * 8 * sc;
+              }
+
+          void Ovl::Text(TReal32 x, TReal32 y, TReal32 sc, const char* s, TUint32 c)
+              {
+              if (!gProg) return;
+              for (; *s; ++s)
+                  {
+                  int ch = (unsigned char)*s;
+                  if (ch < 32 || ch > 127) ch = '?';
+                  if (ch != 32)
+                      {
+                      int idx = ch - 32;
+                      float u0 = (float)((idx & 15) * 8) / KTexW, v0 = (float)((idx >> 4) * 12) / KTexH;
+                      float u1 = u0 + 8.0f / KTexW, v1 = v0 + 12.0f / KTexH;
+                      float x1 = x + 8 * sc, y1 = y + 12 * sc;
+                      Tri(x, y, u0, v0, x1, y, u1, v0, x1, y1, u1, v1, c);
+                      Tri(x, y, u0, v0, x1, y1, u1, v1, x, y1, u0, v1, c);
+                      }
+                  x += 8 * sc;
+                  }
+              }
+          EOF_SM64
+          mkdir -p "$(dirname symbian/app/src/sm64_view.cpp)"
+          cat > symbian/app/src/sm64_view.cpp <<'EOF_SM64'
+          // Main control: loading/error screens, frame loop, multi-touch N64 pad (GL overlay), menu.
+          #include <aknutils.h>
+          #include <avkon.hrh>
+          #include <eikon.hrh>
+          #include <eikenv.h>
+          #include <w32std.h>
+          #include <GLES2/gl2.h>
+          #include <bautils.h>
+          #include <e32math.h>
+          #include "sm64app.h"
+
+          static const TInt64 KStepUs = 33333;   // SM64 logic runs at 30 Hz
+          static const TInt KTimerUs = 8000;
+
+          _LIT(KLoading1, "Starting Super Mario 64...");
+          _LIT(KErrTitle, "Super Mario 64 could not start");
+
+          // ---------------------------------------------------------------------------
+          // GL window
+          // ---------------------------------------------------------------------------
+          CSm64GlView* CSm64GlView::NewL(const TRect& aRect)
+              {
+              CSm64GlView* self = new (ELeave) CSm64GlView;
+              self->iChild = NULL;
+              CleanupStack::PushL(self);
+              self->CreateWindowL();
+              self->SetExtentToWholeScreen();
+              self->Window().SetBackgroundColor(KRgbBlack);   // black comes from the window, never from Draw()
+              self->SetRect(aRect);
+              self->ActivateL();
+              CleanupStack::Pop(self);
+              return self;
+              }
+
+          void CSm64GlView::Draw(const TRect& /*aRect*/) const {}
+
+          // ---------------------------------------------------------------------------
+          // exception logging
+          // ---------------------------------------------------------------------------
+          static void Sm64ExcHandler(TExcType aType)
+              {
+              sym_log("[EXC] exception type=%d", (int)aType);
+              RHeap& h = User::Heap();
+              TInt biggest = 0;
+              TInt avail = h.Available(biggest);
+              sym_log("[HEAP] size=%d max=%d free=%d biggest=%d", (int)h.Size(), (int)h.MaxLength(), (int)avail, (int)biggest);
+              User::Panic(_L("Sm64Exc"), (TInt)aType);
+              }
+
+          // ---------------------------------------------------------------------------
+          // container
+          // ---------------------------------------------------------------------------
+          CSm64Container* CSm64Container::NewL(const TRect& aRect, CSm64GlView* aView)
+              {
+              CSm64Container* self = new (ELeave) CSm64Container;
+              CleanupStack::PushL(self);
+              self->ConstructL(aRect, aView);
+              CleanupStack::Pop(self);
+              return self;
+              }
+
+          CSm64Container::CSm64Container() {}
+
+          CSm64Container::~CSm64Container()
+              {
+              StopTimer();
+              sym_input.buttons = 0;
+              sym_input.stick_x = 0;
+              sym_input.stick_y = 0;
+              delete iTimer;
+              delete iIdle;
+              delete iAudio;
+              iAudio = NULL;
+              Sym_SetOverlay(NULL, NULL);
+              if (iStarted) Sym_Shutdown();
+              if (iGlUp)
+                  {
+                  Ovl::Release();
+                  Sym_GlShutdown();
+                  }
+              iFs.Close();
+              }
+
+          static void OverlayThunk(void* aCtx, int aW, int aH)
+              {
+              static_cast<CSm64Container*>(aCtx)->DrawOverlay(aW, aH);
+              }
+
+          void CSm64Container::ConstructL(const TRect& aRect, CSm64GlView* aView)
+              {
+              iView = aView;
+              SetContainerWindowL(*aView);
+              EnableDragEvents();
+          #ifdef Z3_MULTITOUCH
+              Window().EnableAdvancedPointers();
+          #endif
+              SetFocusing(ETrue);
+              User::LeaveIfError(iFs.Connect());
+
+              iMode = ELoading;
+              iForeground = ETrue;
+              iStickPtr = -1;
+              iMenuSel = 0;
+              for (TInt i = 0; i < KMaxPtrs; ++i) iPtrDown[i] = EFalse;
+
+              SetRect(aRect);
+              ActivateL();
+
+              iTimer = CPeriodic::NewL(CActive::EPriorityStandard);
+              iIdle = CIdle::NewL(CActive::EPriorityIdle);
+              iIdle->Start(TCallBack(InitCb, this));   // lets the loading screen appear first
+              }
+
+          TInt CSm64Container::InitCb(TAny* aPtr)
+              {
+              static_cast<CSm64Container*>(aPtr)->DoInit();
+              return 0;
+              }
+
+          void CSm64Container::SetError(const TDesC8& aText)
+              {
+              iErrLine1.Zero();
+              iErrLine2.Zero();
+              TInt len = aText.Length();
+              const TInt split = 56;
+              if (len <= split) iErrLine1.Copy(aText);
+              else
+                  {
+                  TInt cut = split;
+                  while (cut > 20 && aText[cut] != 32) --cut;
+                  iErrLine1.Copy(aText.Left(cut));
+                  iErrLine2.Copy(aText.Mid(cut).Left(iErrLine2.MaxLength()));
+                  }
+              ReleaseAll();
+              iMode = EError;
+              sym_log("[ERR] %S", &aText);
+              }
+
+          // First drive that already has \sm64 (E: mass memory, F: card first), else create it on the first writable one.
+          TBool CSm64Container::FindUserDir(TDes8& aPath)
+              {
+              TDriveList list;
+              if (iFs.DriveList(list) != KErrNone) return EFalse;
+              const TInt order[8] = { 4, 5, 2, 6, 7, 3, 8, 9 };
+              for (TInt pass = 0; pass < 2; ++pass)
+                  {
+                  for (TInt k = 0; k < 8; ++k)
+                      {
+                      TInt d = order[k];
+                      if (d >= KMaxDrives || !list[d]) continue;
+                      TFileName dir;
+                      dir.Append((TChar)('A' + d));
+                      dir.Append(_L(":\\sm64\\"));
+                      TBool ok = EFalse;
+                      if (pass == 0) ok = BaflUtils::FolderExists(iFs, dir);
+                      else ok = (iFs.MkDirAll(dir) == KErrNone || BaflUtils::FolderExists(iFs, dir));
+                      if (ok)
+                          {
+                          aPath.Zero();
+                          aPath.Append((TChar)('A' + d));
+                          aPath.Append(_L8(":/sm64"));
+                          return ETrue;
+                          }
+                      }
+                  }
+              return EFalse;
+              }
+
+          void CSm64Container::GlStatusScreen(const char* aL1, const char* aL2)
+              {
+              if (!iGlUp) return;
+              Ovl::Begin(iGlW, iGlH);
+              glClearColor(0.f, 0.f, 0.f, 1.f);
+              glClear(GL_COLOR_BUFFER_BIT);
+              TReal32 sc = iGlH >= 300 ? 2.0f : 1.0f;
+              TReal32 y = iGlH / 2 - 30 * sc;
+              if (aL1) Ovl::Text((iGlW - Ovl::TextWidth(aL1, sc)) / 2, y, sc, aL1, OVL_RGBA(255, 255, 255, 255));
+              if (aL2) Ovl::Text((iGlW - Ovl::TextWidth(aL2, sc)) / 2, y + 20 * sc, sc, aL2, OVL_RGBA(200, 200, 255, 255));
+              Ovl::End();
+              Sym_GlSwap();
+              }
+
+          void CSm64Container::DoInit()
+              {
+              User::SetExceptionHandler(Sm64ExcHandler, KExceptionFault | KExceptionInteger | KExceptionFpe);
+
+              TBuf8<64> path;
+              if (!FindUserDir(path))
+                  {
+                  SetError(_L8("No writable drive found (need <drive>:\\sm64\\)"));
+                  DrawNow();
+                  return;
+                  }
+              path.ZeroTerminate();
+              sym_set_dir((const char*)path.Ptr());
+
+              const char* glErr = Sym_GlInit(&iView->GlWindow());
+              if (glErr)
+                  {
+                  TPtrC8 msg((const TUint8*)glErr);
+                  SetError(msg);
+                  DrawNow();
+                  return;
+                  }
+              iGlUp = ETrue;
+              Sym_GlSize(&iGlW, &iGlH);
+              TInt cw = Rect().Width(), ch = Rect().Height();
+              sym_log("[UI] window %dx%d, gl %dx%d", (int)cw, (int)ch, (int)iGlW, (int)iGlH);
+              if (!Ovl::Init()) sym_log("[UI] overlay init failed (no touch pad)");
+              ComputeLayout(iGlW, iGlH);
+              Sym_SetOverlay(OverlayThunk, this);
+
+              GlStatusScreen("LOADING", "first start can take a while");
+              iStarted = ETrue;   // Sym_Shutdown is safe even after a failed start
+              if (Sym_Start() != 0)
+                  {
+                  const char* e = Sym_Error();
+                  TPtrC8 msg((const TUint8*)(e ? e : "start failed"));
+                  SetError(msg);
+                  return;
+                  }
+              TRAPD(aerr, iAudio = CSm64Audio::NewL());
+              if (aerr != KErrNone) iAudio = NULL;
+
+              iMode = EPlay;
+              iNextDue = sym_time_us();
+              iSkipRun = 0;
+              StartTimer();
+              }
+
+          void CSm64Container::StartTimer()
+              {
+              if (iTimer && !iTimer->IsActive())
+                  {
+                  iNextDue = sym_time_us();
+                  iTimer->Start(KTimerUs, KTimerUs, TCallBack(TickCb, this));
+                  }
+              }
+
+          void CSm64Container::StopTimer()
+              {
+              if (iTimer) iTimer->Cancel();
+              }
+
+          void CSm64Container::SetForeground(TBool aForeground)
+              {
+              iForeground = aForeground;
+              if (!aForeground)
+                  {
+                  ReleaseAll();
+                  if (iAudio) iAudio->Suspend();
+                  StopTimer();
+                  if (iMode == EPlay) iMode = EMenu, iMenuSel = 0;   // come back to the menu, not mid-jump
+                  }
+              else
+                  {
+                  if (iAudio) iAudio->Resume();
+                  if (iMode == EPlay || iMode == EMenu || iMode == EError) StartTimer();
+                  }
+              }
+
+          TInt CSm64Container::TickCb(TAny* aPtr)
+              {
+              static_cast<CSm64Container*>(aPtr)->Tick();
+              return 0;
+              }
+
+          void CSm64Container::Quit()
+              {
+              StopTimer();
+              TRAPD(err, iEikonEnv->EikAppUi()->HandleCommandL(EEikCmdExit));
+              (void)err;
+              }
+
+          void CSm64Container::Tick()
+              {
+              if (!iForeground) return;
+              if (iMode == EError)
+                  {
+                  if (iGlUp)
+                      {
+                      TBuf8<160> a(iErrLine1), b(iErrLine2);
+                      a.ZeroTerminate();
+                      b.ZeroTerminate();
+                      GlStatusScreen((const char*)a.Ptr(), (const char*)b.Ptr());
+                      }
+                  return;
+                  }
+              if (iMode == EMenu)
+                  {
+                  MenuFrame();
+                  return;
+                  }
+              if (iMode != EPlay) return;
+
+              TInt64 now = sym_time_us();
+              TInt steps = 0;
+              while (now >= iNextDue && steps < 3)
+                  {
+                  TBool last = (now < iNextDue + KStepUs) || steps == 2;
+                  TBool render = last || !sym_cfg.frameskip || iSkipRun >= 2;
+                  iSkipRun = render ? 0 : iSkipRun + 1;
+                  iNextDue += KStepUs;
+                  ++steps;
+                  TInt r = Sym_Frame(render ? 1 : 0);
+                  if (r < 0)
+                      {
+                      const char* e = Sym_Error();
+                      TPtrC8 msg((const TUint8*)(e ? e : "fatal error"));
+                      SetError(msg);
+                      return;
+                      }
+                  if (r == 1)
+                      {
+                      Quit();
+                      return;
+                      }
+                  now = sym_time_us();
+                  }
+              if (now - iNextDue > 250000) iNextDue = now;   // far behind: resync instead of fast-forwarding
+              }
+
+          // ---------------------------------------------------------------------------
+          // Layout
+          // ---------------------------------------------------------------------------
+          static TSm64Btn MkCircle(TInt cx, TInt cy, TInt r, TUint mask, const char* label)
+              {
+              TSm64Btn b;
+              b.iCircle = 1;
+              b.iCx = cx; b.iCy = cy; b.iR = r;
+              b.iRect = TRect(cx - r, cy - r, cx + r, cy + r);
+              b.iMask = mask;
+              b.iLabel = label;
+              return b;
+              }
+
+          static TSm64Btn MkRect(TInt x0, TInt y0, TInt x1, TInt y1, TUint mask, const char* label)
+              {
+              TSm64Btn b;
+              b.iCircle = 0;
+              b.iCx = (x0 + x1) / 2; b.iCy = (y0 + y1) / 2; b.iR = 0;
+              b.iRect = TRect(x0, y0, x1, y1);
+              b.iMask = mask;
+              b.iLabel = label;
+              return b;
+              }
+
+          void CSm64Container::SizeChanged()
+              {
+              if (iGlUp)
+                  {
+                  Sym_GlSize(&iGlW, &iGlH);
+                  ComputeLayout(iGlW, iGlH);
+                  }
+              }
+
+          void CSm64Container::ComputeLayout(TInt w, TInt h)
+              {
+              iLayW = w;
+              iLayH = h;
+              TReal32 s = (TReal32)sym_cfg.scale / 100.0f;
+              TReal32 base = (TReal32)Min(h / 5, w / 8);
+              TReal32 U = base * s;
+              iUnit = U;
+              const TBool mir = sym_cfg.mirror;
+          #define MX(x) (mir ? (w - (x)) : (x))
+              TInt k = 0;
+              // A / B (bottom-right)
+              iBtn[k++] = MkCircle(MX(w - (TInt)(1.5f * U)), h - (TInt)(1.6f * U), (TInt)(0.85f * U), SYM_BTN_A, "A");
+              iBtn[k++] = MkCircle(MX(w - (TInt)(3.2f * U)), h - (TInt)(1.0f * U), (TInt)(0.75f * U), SYM_BTN_B, "B");
+              // C cluster
+              TInt ccx = w - (TInt)(1.8f * U), ccy = h - (TInt)(4.3f * U);
+              TInt co = (TInt)(0.85f * U), cr = (TInt)(0.5f * U);
+              iBtn[k++] = MkCircle(MX(ccx), ccy - co, cr, SYM_BTN_CU, "^");
+              iBtn[k++] = MkCircle(MX(ccx), ccy + co, cr, SYM_BTN_CD, "v");
+              iBtn[k++] = MkCircle(MX(ccx - co), ccy, cr, SYM_BTN_CL, "<");
+              iBtn[k++] = MkCircle(MX(ccx + co), ccy, cr, SYM_BTN_CR, ">");
+              // Z / L / R
+              TInt bw = (TInt)(2.0f * U), bh = (TInt)(0.95f * U), m = (TInt)(0.2f * U);
+              if (!mir)
+                  {
+                  iBtn[k++] = MkRect(m, m + bh + m, m + bw, m + bh + m + bh, SYM_BTN_Z, "Z");
+                  iBtn[k++] = MkRect(m, m, m + bw, m + bh, SYM_BTN_L, "L");
+                  iBtn[k++] = MkRect(w - m - bw, m, w - m, m + bh, SYM_BTN_R, "R");
+                  }
+              else
+                  {
+                  iBtn[k++] = MkRect(w - m - bw, m + bh + m, w - m, m + bh + m + bh, SYM_BTN_Z, "Z");
+                  iBtn[k++] = MkRect(w - m - bw, m, w - m, m + bh, SYM_BTN_L, "L");
+                  iBtn[k++] = MkRect(m, m, m + bw, m + bh, SYM_BTN_R, "R");
+                  }
+              // START / MENU (centred)
+              TInt sw = (TInt)(1.1f * U);
+              iBtn[k++] = MkRect(w / 2 - sw, h - m - bh, w / 2 + sw, h - m, SYM_BTN_START, "START");
+              iBtn[k++] = MkRect(w / 2 - sw, m, w / 2 + sw, m + bh, KMenuMask, "MENU");
+          #undef MX
+              iStickR = (TInt)(1.7f * U);
+              iStickFixed = TPoint(mir ? w - (TInt)(2.4f * U) : (TInt)(2.4f * U), h - (TInt)(2.3f * U));
+              }
+
+          TBool CSm64Container::OnButton(const TSm64Btn& b, const TPoint& p) const
+              {
+              if (b.iCircle)
+                  {
+                  TInt dx = p.iX - b.iCx, dy = p.iY - b.iCy;
+                  TInt r = b.iR + b.iR / 4;    // forgiving hit area
+                  return dx * dx + dy * dy <= r * r;
+                  }
+              TRect r = b.iRect;
+              r.Grow(b.iRect.Height() / 8, b.iRect.Height() / 8);
+              return r.Contains(p);
+              }
+
+          // ---------------------------------------------------------------------------
+          // Overlay drawing (called from gfx_symbian swap_buffers_end, inside the GL frame)
+          // ---------------------------------------------------------------------------
+          void CSm64Container::DrawOverlay(TInt aW, TInt aH)
+              {
+              if (!iGlUp) return;
+              if (aW != iLayW || aH != iLayH) ComputeLayout(aW, aH);
+              Ovl::Begin(aW, aH);
+              if (sym_cfg.show_pad && iMode == EPlay) 
+                  {
+                  const TUint a = (TUint)(sym_cfg.opacity * 255 / 100);
+                  const TUint down = iTouchBits | iKeyBits;
+                  const TUint line = OVL_RGBA(255, 255, 255, a);
+                  const TUint fillUp = OVL_RGBA(255, 255, 255, a / 5);
+                  const TUint fillDn = OVL_RGBA(255, 255, 255, a * 2 / 3);
+                  // stick
+                  TPoint c = iStickPtr >= 0 ? iStickO : iStickFixed;
+                  if (sym_cfg.float_stick && iStickPtr < 0)
+                      {
+                      // idle floating stick: faint hint at the default spot
+                      Ovl::Circle((TReal32)c.iX, (TReal32)c.iY, (TReal32)iStickR, OVL_RGBA(255, 255, 255, a / 8));
+                      }
+                  else
+                      {
+                      Ovl::Circle((TReal32)c.iX, (TReal32)c.iY, (TReal32)iStickR, OVL_RGBA(255, 255, 255, a / 5));
+                      Ovl::Circle((TReal32)c.iX, (TReal32)c.iY, (TReal32)iStickR - 3, OVL_RGBA(0, 0, 0, a / 3));
+                      }
+                  TPoint k = iStickPtr >= 0 ? iStickCur : c;
+                  if (iKeyDirs)
+                      {
+                      TInt dx = (iKeyDirs & 8 ? 1 : 0) - (iKeyDirs & 4 ? 1 : 0);
+                      TInt dy = (iKeyDirs & 2 ? 1 : 0) - (iKeyDirs & 1 ? 1 : 0);
+                      k = TPoint(c.iX + dx * iStickR / 2, c.iY + dy * iStickR / 2);
+                      }
+                  Ovl::Circle((TReal32)k.iX, (TReal32)k.iY, (TReal32)iStickR * 0.45f, fillDn);
+                  // buttons
+                  for (TInt i = 0; i < KBtns; ++i)
+                      {
+                      const TSm64Btn& b = iBtn[i];
+                      TBool on = (b.iMask != KMenuMask) && (down & b.iMask);
+                      TUint fill = on ? fillDn : fillUp;
+                      if (b.iCircle)
+                          {
+                          Ovl::Circle((TReal32)b.iCx, (TReal32)b.iCy, (TReal32)b.iR, line);
+                          Ovl::Circle((TReal32)b.iCx, (TReal32)b.iCy, (TReal32)b.iR - 2, on ? fill : OVL_RGBA(0, 0, 0, a / 2));
+                          if (on) Ovl::Circle((TReal32)b.iCx, (TReal32)b.iCy, (TReal32)b.iR - 2, fill);
+                          }
+                      else
+                          {
+                          Ovl::Quad((TReal32)b.iRect.iTl.iX, (TReal32)b.iRect.iTl.iY, (TReal32)b.iRect.iBr.iX, (TReal32)b.iRect.iBr.iY, line);
+                          Ovl::Quad((TReal32)b.iRect.iTl.iX + 2, (TReal32)b.iRect.iTl.iY + 2, (TReal32)b.iRect.iBr.iX - 2, (TReal32)b.iRect.iBr.iY - 2,
+                                    on ? fill : OVL_RGBA(0, 0, 0, a / 2));
+                          }
+                      TReal32 ts = iUnit >= 48 ? 2.0f : 1.0f;
+                      TReal32 tw = Ovl::TextWidth(b.iLabel, ts);
+                      Ovl::Text(b.iCx - tw / 2, b.iCy - 6 * ts, ts, b.iLabel, line);
+                      }
+                  }
+              if (sym_cfg.show_fps)
+                  {
+                  int lf = 0, rf = 0;
+                  Sym_Fps(&lf, &rf);
+                  char buf[32];
+                  buf[0] = 0;
+                  // no sprintf float: tiny int formatting
+                  char* p = buf;
+                  const int vals[2] = { lf, rf };
+                  for (int v = 0; v < 2; ++v)
+                      {
+                      int n = vals[v];
+                      char t[8]; int tl = 0;
+                      if (n == 0) t[tl++] = '0';
+                      while (n > 0 && tl < 7) { t[tl++] = (char)('0' + n % 10); n /= 10; }
+                      while (tl > 0) *p++ = t[--tl];
+                      *p++ = v == 0 ? '/' : 0;
+                      }
+                  Ovl::Text(aW / 2 + 70.f, 4.f, 1.0f, buf, OVL_RGBA(255, 255, 0, 255));
+                  }
+              Ovl::End();
+              }
+
+          // ---------------------------------------------------------------------------
+          // Menu
+          // ---------------------------------------------------------------------------
+          void CSm64Container::OpenMenu()
+              {
+              ReleaseAll();
+              iMode = EMenu;
+              iMenuSel = 0;
+              }
+
+          void CSm64Container::CloseMenu()
+              {
+              sym_settings_save();
+              iMode = EPlay;
+              iNextDue = sym_time_us();
+              }
+
+          void CSm64Container::MenuLabel(TInt i, TBuf8<48>& o) const
+              {
+              o.Zero();
+              switch (i)
+                  {
+                  case 0: o.Append(_L8("Resume")); break;
+                  case 1: o.Append(sym_cfg.sound ? _L8("Sound: on") : _L8("Sound: off")); break;
+                  case 2: o.Append(sym_cfg.show_pad ? _L8("Touch pad: on") : _L8("Touch pad: off")); break;
+                  case 3: o.Append(sym_cfg.float_stick ? _L8("Stick: floating") : _L8("Stick: fixed")); break;
+                  case 4: o.Append(sym_cfg.mirror ? _L8("Layout: mirrored") : _L8("Layout: normal")); break;
+                  case 5: o.Append(_L8("Opacity: ")); o.AppendNum(sym_cfg.opacity); o.Append(_L8("%")); break;
+                  case 6: o.Append(_L8("Pad size: ")); o.AppendNum(sym_cfg.scale); o.Append(_L8("%")); break;
+                  case 7: o.Append(sym_cfg.frameskip ? _L8("Frameskip: auto") : _L8("Frameskip: off")); break;
+                  case 8: o.Append(sym_cfg.show_fps ? _L8("FPS counter: on") : _L8("FPS counter: off")); break;
+                  default: o.Append(_L8("Exit")); break;
+                  }
+              }
+
+          void CSm64Container::MenuAction(TInt a)
+              {
+              switch (a)
+                  {
+                  case 0: CloseMenu(); return;
+                  case 1: sym_cfg.sound = !sym_cfg.sound; Sym_SetSound(sym_cfg.sound); break;
+                  case 2: sym_cfg.show_pad = !sym_cfg.show_pad; break;
+                  case 3: sym_cfg.float_stick = !sym_cfg.float_stick; break;
+                  case 4: sym_cfg.mirror = !sym_cfg.mirror; ComputeLayout(iLayW, iLayH); break;
+                  case 5: sym_cfg.opacity += 15; if (sym_cfg.opacity > 100) sym_cfg.opacity = 25; break;
+                  case 6: sym_cfg.scale += 10; if (sym_cfg.scale > 140) sym_cfg.scale = 70; ComputeLayout(iLayW, iLayH); break;
+                  case 7: sym_cfg.frameskip = !sym_cfg.frameskip; break;
+                  case 8: sym_cfg.show_fps = !sym_cfg.show_fps; break;
+                  default:
+                      sym_settings_save();
+                      Quit();
+                      return;
+                  }
+              }
+
+          void CSm64Container::MenuGeom(TInt& x, TInt& y, TInt& w, TInt& row, TInt& sc) const
+              {
+              row = iGlH / (KMenuItems + 1);
+              sc = row >= 30 ? 2 : 1;
+              w = Min(iGlW - 20, 17 * 8 * sc + 32);
+              x = (iGlW - w) / 2;
+              y = (iGlH - row * KMenuItems) / 2;
+              }
+
+          TInt CSm64Container::MenuRowAt(const TPoint& p) const
+              {
+              TInt x, y, w, row, sc;
+              MenuGeom(x, y, w, row, sc);
+              if (p.iX < x || p.iX >= x + w || p.iY < y || p.iY >= y + row * KMenuItems) return -1;
+              return (p.iY - y) / row;
+              }
+
+          void CSm64Container::MenuFrame()
+              {
+              if (!iGlUp) return;
+              TInt x, y, w, row, sc;
+              MenuGeom(x, y, w, row, sc);
+              Ovl::Begin(iGlW, iGlH);
+              glClearColor(0.04f, 0.04f, 0.10f, 1.f);
+              glClear(GL_COLOR_BUFFER_BIT);
+              Ovl::Quad((TReal32)x - 4, (TReal32)y - 4, (TReal32)(x + w) + 4, (TReal32)(y + row * KMenuItems) + 4, OVL_RGBA(255, 255, 255, 200));
+              Ovl::Quad((TReal32)x - 2, (TReal32)y - 2, (TReal32)(x + w) + 2, (TReal32)(y + row * KMenuItems) + 2, OVL_RGBA(10, 10, 30, 255));
+              for (TInt i = 0; i < KMenuItems; ++i)
+                  {
+                  TInt ry = y + i * row;
+                  if (i == iMenuSel) Ovl::Quad((TReal32)x, (TReal32)ry, (TReal32)(x + w), (TReal32)(ry + row), OVL_RGBA(70, 70, 150, 255));
+                  TBuf8<48> lbl;
+                  MenuLabel(i, lbl);
+                  lbl.ZeroTerminate();
+                  const char* s = (const char*)lbl.Ptr();
+                  TReal32 tw = Ovl::TextWidth(s, (TReal32)sc);
+                  Ovl::Text(x + (w - tw) / 2, ry + (row - 12 * sc) / 2.0f, (TReal32)sc, s, OVL_RGBA(255, 255, 255, 255));
+                  }
+              Ovl::End();
+              Sym_GlSwap();
+              }
+
+          // ---------------------------------------------------------------------------
+          // Input
+          // ---------------------------------------------------------------------------
+          void CSm64Container::PushInput()
+              {
+              TInt sx = iTouchSx, sy = iTouchSy;
+              if (iKeyDirs)
+                  {
+                  TInt kx = (iKeyDirs & 8 ? 80 : 0) - (iKeyDirs & 4 ? 80 : 0);
+                  TInt ky = (iKeyDirs & 1 ? 80 : 0) - (iKeyDirs & 2 ? 80 : 0);
+                  if (kx) sx = kx;
+                  if (ky) sy = ky;
+                  }
+              sym_input.buttons = (uint16_t)(iTouchBits | iKeyBits);
+              sym_input.stick_x = (int8_t)sx;
+              sym_input.stick_y = (int8_t)sy;
+              }
+
+          void CSm64Container::ReleaseAll()
+              {
+              iTouchBits = 0;
+              iKeyBits = 0;
+              iKeyDirs = 0;
+              iTouchSx = iTouchSy = 0;
+              iStickPtr = -1;
+              for (TInt i = 0; i < KMaxPtrs; ++i) iPtrDown[i] = EFalse;
+              PushInput();
+              }
+
+          void CSm64Container::UpdateTouch()
+              {
+              TUint bits = 0;
+              TInt sx = 0, sy = 0;
+              for (TInt i = 0; i < KMaxPtrs; ++i)
+                  {
+                  if (!iPtrDown[i]) continue;
+                  if (i == iStickPtr)
+                      {
+                      TInt dx = iPtrPos[i].iX - iStickO.iX;
+                      TInt dy = iPtrPos[i].iY - iStickO.iY;
+                      TInt r = iStickR;
+                      // clamp the knob to the ring, floating stick follows the finger past the edge
+                      TInt d2 = dx * dx + dy * dy;
+                      if (d2 > r * r)
+                          {
+                          TReal d;
+                          Math::Sqrt(d, (TReal)d2);
+                          TReal f = (TReal)r / d;
+                          TInt cx = (TInt)(dx * f), cy = (TInt)(dy * f);
+                          if (sym_cfg.float_stick)
+                              {
+                              iStickO.iX += dx - cx;
+                              iStickO.iY += dy - cy;
+                              }
+                          dx = cx;
+                          dy = cy;
+                          }
+                      iStickCur = TPoint(iStickO.iX + dx, iStickO.iY + dy);
+                      TInt dead = r / 6;
+                      if (dx * dx + dy * dy > dead * dead)
+                          {
+                          sx = dx * 80 / r;
+                          sy = -dy * 80 / r;
+                          }
+                      continue;
+                      }
+                  for (TInt b = 0; b < KBtns; ++b)
+                      if (iBtn[b].iMask != KMenuMask && OnButton(iBtn[b], iPtrPos[i])) bits |= iBtn[b].iMask;
+                  }
+              iTouchBits = bits;
+              iTouchSx = sx;
+              iTouchSy = sy;
+              PushInput();
+              }
+
+          void CSm64Container::HandlePointerEventL(const TPointerEvent& aEvent)
+              {
+              TPoint pt = aEvent.iPosition;
+              TInt id = 0;
+          #ifdef Z3_MULTITOUCH
+              const TAdvancedPointerEvent* adv = aEvent.AdvancedPointerEvent();
+              if (adv) id = adv->PointerNumber();
+          #endif
+              if (id < 0 || id >= KMaxPtrs) return;
+              // window -> GL pixel space (identical on all known devices, scaled if not)
+              TInt cw = Rect().Width(), ch = Rect().Height();
+              if (iGlUp && cw > 0 && ch > 0 && (cw != iGlW || ch != iGlH))
+                  pt = TPoint(pt.iX * iGlW / cw, pt.iY * iGlH / ch);
+
+              if (iMode == EPlay)
+                  {
+                  if (aEvent.iType == TPointerEvent::EButton1Down)
+                      {
+                      for (TInt b = 0; b < KBtns; ++b)
+                          if (iBtn[b].iMask == KMenuMask && OnButton(iBtn[b], pt))
+                              {
+                              OpenMenu();
+                              return;
+                              }
+                      iPtrDown[id] = ETrue;
+                      iPtrPos[id] = pt;
+                      if (iStickPtr < 0)
+                          {
+                          TBool onBtn = EFalse;
+                          for (TInt b = 0; b < KBtns; ++b)
+                              if (OnButton(iBtn[b], pt)) { onBtn = ETrue; break; }
+                          if (!onBtn)
+                              {
+                              TBool leftSide = sym_cfg.mirror ? (pt.iX >= iGlW / 2) : (pt.iX < iGlW / 2);
+                              TInt fx = pt.iX - iStickFixed.iX, fy = pt.iY - iStickFixed.iY;
+                              TInt lim = iStickR * 3 / 2;
+                              if (sym_cfg.float_stick ? leftSide : (fx * fx + fy * fy <= lim * lim))
+                                  {
+                                  iStickPtr = id;
+                                  iStickO = sym_cfg.float_stick ? pt : iStickFixed;
+                                  iStickCur = pt;
+                                  }
+                              }
+                          }
+                      }
+                  else if (aEvent.iType == TPointerEvent::EDrag)
+                      {
+                      iPtrDown[id] = ETrue;
+                      iPtrPos[id] = pt;
+                      }
+                  else if (aEvent.iType == TPointerEvent::EButton1Up)
+                      {
+                      iPtrDown[id] = EFalse;
+                      if (iStickPtr == id) iStickPtr = -1;
+                      }
+                  UpdateTouch();
+                  return;
+                  }
+
+              if (iMode == EMenu)
+                  {
+                  if (aEvent.iType == TPointerEvent::EButton1Down)
+                      {
+                      TInt r = MenuRowAt(pt);
+                      if (r >= 0) iMenuSel = r;
+                      }
+                  else if (aEvent.iType == TPointerEvent::EButton1Up)
+                      {
+                      TInt r = MenuRowAt(pt);
+                      if (r >= 0) MenuAction(r);
+                      else CloseMenu();
+                      }
+                  return;
+                  }
+
+              if (iMode == EError && aEvent.iType == TPointerEvent::EButton1Up) Quit();
+              }
+
+          TKeyResponse CSm64Container::OfferKeyEventL(const TKeyEvent& aKey, TEventCode aType)
+              {
+              const TInt sc = aKey.iScanCode;
+
+              if (iMode == EPlay)
+                  {
+                  TUint bit = 0, dir = 0;
+                  switch (sc)
+                      {
+                      case EStdKeyUpArrow:    dir = 1; break;
+                      case EStdKeyDownArrow:  dir = 2; break;
+                      case EStdKeyLeftArrow:  dir = 4; break;
+                      case EStdKeyRightArrow: dir = 8; break;
+                      case 'X': case EStdKeySpace: case EStdKeyDevice3: bit = SYM_BTN_A; break;
+                      case 'C': case EStdKeyBackspace: bit = SYM_BTN_B; break;
+                      case 'Z':               bit = SYM_BTN_Z; break;
+                      case EStdKeyEnter:      bit = SYM_BTN_START; break;
+                      case 'Q':               bit = SYM_BTN_L; break;
+                      case 'W':               bit = SYM_BTN_R; break;
+                      case 'T':               bit = SYM_BTN_CU; break;
+                      case 'G':               bit = SYM_BTN_CD; break;
+                      case 'F':               bit = SYM_BTN_CL; break;
+                      case 'H':               bit = SYM_BTN_CR; break;
+                      default: break;
+                      }
+                  if (aType == EEventKeyDown && sc == EStdKeyDevice0)   // left soft key
+                      {
+                      OpenMenu();
+                      return EKeyWasConsumed;
+                      }
+                  if (bit || dir)
+                      {
+                      if (aType == EEventKeyDown) { iKeyBits |= bit; iKeyDirs |= dir; }
+                      else if (aType == EEventKeyUp) { iKeyBits &= ~bit; iKeyDirs &= ~dir; }
+                      PushInput();
+                      return EKeyWasConsumed;
+                      }
+                  return EKeyWasNotConsumed;
+                  }
+
+              if (aType != EEventKeyDown)
+                  {
+                  return (sc == EStdKeyUpArrow || sc == EStdKeyDownArrow || sc == EStdKeyEnter ||
+                          sc == EStdKeyDevice3 || sc == EStdKeyDevice0) ? EKeyWasConsumed : EKeyWasNotConsumed;
+                  }
+
+              if (iMode == EMenu)
+                  {
+                  if (sc == EStdKeyUpArrow && iMenuSel > 0) --iMenuSel;
+                  else if (sc == EStdKeyDownArrow && iMenuSel < KMenuItems - 1) ++iMenuSel;
+                  else if (sc == EStdKeyEnter || sc == EStdKeyDevice3) MenuAction(iMenuSel);
+                  else if (sc == EStdKeyDevice0) CloseMenu();
+                  else return EKeyWasNotConsumed;
+                  return EKeyWasConsumed;
+                  }
+
+              if (iMode == EError && (sc == EStdKeyEnter || sc == EStdKeyDevice3 || sc == EStdKeyDevice0))
+                  {
+                  Quit();
+                  return EKeyWasConsumed;
+                  }
+              return EKeyWasNotConsumed;
+              }
+
+          // ---------------------------------------------------------------------------
+          // gc drawing before GL is up (loading / early errors)
+          // ---------------------------------------------------------------------------
+          void CSm64Container::Draw(const TRect& /*aRect*/) const
+              {
+              if (iGlUp) return;   // the EGL surface owns the pixels
+              CWindowGc& gc = SystemGc();
+              gc.SetPenStyle(CGraphicsContext::ESolidPen);
+              gc.SetBrushStyle(CGraphicsContext::ESolidBrush);
+              gc.SetBrushColor(TRgb(0, 0, 0, 255));
+              gc.Clear(Rect());
+              gc.SetPenColor(TRgb(255, 255, 255, 255));
+              const CFont* font = iEikonEnv->NormalFont();
+              gc.UseFont(font);
+              TInt y = Rect().Height() / 2 - 40;
+              TBuf<160> t;
+              if (iMode == ELoading)
+                  {
+                  gc.DrawText(KLoading1, TRect(0, y, Rect().Width(), y + 30), font->AscentInPixels() + 4, CGraphicsContext::ECenter, 0);
+                  }
+              else
+                  {
+                  gc.DrawText(KErrTitle, TRect(0, y, Rect().Width(), y + 30), font->AscentInPixels() + 4, CGraphicsContext::ECenter, 0);
+                  t.Copy(iErrLine1);
+                  gc.DrawText(t, TRect(0, y + 34, Rect().Width(), y + 64), font->AscentInPixels() + 4, CGraphicsContext::ECenter, 0);
+                  t.Copy(iErrLine2);
+                  gc.DrawText(t, TRect(0, y + 60, Rect().Width(), y + 90), font->AscentInPixels() + 4, CGraphicsContext::ECenter, 0);
+                  }
+              gc.DiscardFont();
+              }
+          EOF_SM64
+          mkdir -p "$(dirname symbian/tools/fakecc.sh)"
+          cat > symbian/tools/fakecc.sh <<'EOF_SM64'
+          #!/bin/sh
+          # Stand-in compiler for the host asset pass: creates the outputs make expects, compiles nothing.
+          out=""; mf=""; prev=""
+          for a in "$@"; do
+            case "$prev" in -o) out="$a";; -MF) mf="$a";; esac
+            prev="$a"
+          done
+          [ -n "$mf" ] && : > "$mf"
+          [ -n "$out" ] && { mkdir -p "$(dirname "$out")"; : > "$out"; }
+          exit 0
+          EOF_SM64
+          mkdir -p "$(dirname symbian/tools/prepare_symbian.py)"
+          cat > symbian/tools/prepare_symbian.py <<'EOF_SM64'
+          #!/usr/bin/env python3
+          """Host pass for the Symbian build.
+
+          1. runs the real sm64ex Makefile (TARGET_SYMBIAN=1, fake compiler) so every generated source is produced
+             from the user's ROM: textures, text, sound banks, anim/demo data, skyboxes
+          2. lists the C sources, writes uniquely named wrapper .c files (abld names objects by basename)
+          3. fills symbian/app/group/sm64.mmp.in -> sm64.mmp
+          usage: prepare_symbian.py [--opt -O2] [--fpu vfp|softvfp] [--gccinc DIR] [--skip-make]
+          """
+          import argparse, os, re, subprocess, sys, glob
+
+          ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+          os.chdir(ROOT)
+          ap = argparse.ArgumentParser()
+          ap.add_argument('--opt', default='-O2')
+          ap.add_argument('--fpu', default='vfp')
+          ap.add_argument('--gccinc', default='/usr/include')
+          ap.add_argument('--skip-make', action='store_true')
+          ap.add_argument('--version', default='us')
+          args = ap.parse_args()
+
+          FAKE = os.path.join(ROOT, 'symbian/tools/fakecc.sh')
+          MK = ['make', 'TARGET_SYMBIAN=1', 'TARGET_IOS=0', 'VERSION=' + args.version, 'CC=' + FAKE, 'CXX=' + FAKE]
+          J = ['-j%d' % (os.cpu_count() or 2)]
+
+          def run(cmd, check=True):
+              print('+', ' '.join(cmd[:8]), '...' if len(cmd) > 8 else '', flush=True)
+              r = subprocess.run(cmd)
+              if check and r.returncode:
+                  sys.exit('failed: %s' % cmd[0])
+              return r.returncode
+
+          # ---- variables ----
+          DUMP = os.path.join(ROOT, 'symbian/tools/.dump.mk')
+          VARS = ['C_FILES', 'M_FILES', 'GODDARD_C_FILES', 'ULTRA_C_FILES', 'GENERATED_C_FILES', 'BUILD_DIR',
+                  'SOUND_BIN_DIR', 'VERSION_CFLAGS', 'GRUCODE_CFLAGS', 'BACKEND_CFLAGS', 'CRASH_TEXTURE_C_FILES']
+          with open(DUMP, 'w') as f:
+              f.write('symbian-dump:\n')
+              for v in VARS:
+                  f.write('\t@echo "SYMDUMP:%s:$(%s)"\n' % (v, v))
+          out = subprocess.run(MK + ['-s', '-f', 'Makefile', '-f', DUMP, 'symbian-dump'], stdout=subprocess.PIPE, text=True)
+          if out.returncode:
+              sys.exit('make (variable dump) failed - is baserom.%s.z64 in the repo root?' % args.version)
+          V = {}
+          for line in out.stdout.splitlines():
+              if line.startswith('SYMDUMP:'):
+                  _, k, val = line.split(':', 2)
+                  V[k] = val.split()
+                  V[k + '_RAW'] = val
+          BUILD = V['BUILD_DIR'][0]
+
+          # ---- generate ----
+          if not args.skip_make:
+              pngs = []
+              for d in ('actors', 'levels', 'textures'):
+                  for dp, dn, fn in os.walk(d):
+                      if 'skyboxes' in dp or 'skybox_tiles' in dp:
+                          continue
+                      for n in fn:
+                          if n.endswith('.png'):
+                              pngs.append(os.path.join(BUILD, dp, n[:-4] + '.inc.c'))
+              # pass 1: every texture include (compiler-discovered deps do not exist with a fake compiler)
+              for i in range(0, len(pngs), 400):
+                  run(MK + ['-k'] + J + pngs[i:i + 400], check=False)
+              # pass 2: everything else (text, sound, anims, demos, skyboxes, headers)
+              run(MK + ['-k'] + J + ['all'], check=False)
+              extra = [BUILD + '/include/text_strings.h', BUILD + '/text/%s/define_text.inc.c' % args.version,
+                       BUILD + '/text/%s/define_courses.inc.c' % args.version]
+              extra += V.get('GENERATED_C_FILES', []) + V.get('CRASH_TEXTURE_C_FILES', [])
+              run(MK + ['-k'] + J + extra, check=False)
+
+          missing = [f for f in V.get('GENERATED_C_FILES', []) if not os.path.exists(f)]
+          snd = os.path.join(V['SOUND_BIN_DIR'][0], 'sound_data.ctl.inc.c')
+          if not os.path.exists(snd):
+              missing.append(snd)
+          if missing:
+              sys.exit('asset generation incomplete, missing:\n  ' + '\n  '.join(missing))
+
+          # ---- sources ----
+          EXCL = re.compile(r'(sdl|dxgi|direct3d|wasapi|emscripten|xinput|discord|opengl_legacy|uikit)', re.I)
+          src = []
+          for f in V['C_FILES'] + V['GODDARD_C_FILES'] + V['ULTRA_C_FILES']:
+              if f.startswith(BUILD + '/'):
+                  continue
+              if EXCL.search(os.path.basename(f)) and 'symbian' not in f:
+                  continue
+              src.append(f)
+          src += V['GENERATED_C_FILES']
+          src.append('sound/sound_data.c')
+
+          # ObjC files that are plain C once '#import' is dropped (iOS-only branches are TARGET_OS_TV, undefined here)
+          gen_dir = os.path.join(BUILD, 'symbian_gen')
+          os.makedirs(gen_dir, exist_ok=True)
+          for m in ('src/pc/configfile.m', 'src/pc/ultra_reimplementation.m'):
+              txt = open(m).read()
+              txt = re.sub(r'^\s*#import.*$', '', txt, flags=re.M)
+              dst = os.path.join(gen_dir, os.path.basename(m)[:-2] + '.c')
+              open(dst, 'w').write(txt)
+              src.append(dst)
+
+          seen, uniq = set(), []
+          for f in src:
+              if f not in seen:
+                  seen.add(f)
+                  uniq.append(f)
+          src = [f for f in uniq if os.path.exists(f)]
+
+          # ---- wrappers: gen/w_<n>_<base>.c  #include the real file; the object name is then unique ----
+          wr_dir = os.path.join(ROOT, 'symbian/app/gen')
+          os.makedirs(wr_dir, exist_ok=True)
+          for old in glob.glob(wr_dir + '/*.c'):
+              os.remove(old)
+          names = []
+          for i, f in enumerate(sorted(src)):
+              base = re.sub(r'[^A-Za-z0-9]', '_', os.path.splitext(f)[0])[-48:]
+              name = 'w%04d_%s.c' % (i, base)
+              with open(os.path.join(wr_dir, name), 'w') as w:
+                  # the include path is resolved against the repo root (USERINCLUDE ../../..)
+                  w.write('/* generated */\n#include "%s"\n' % f)
+              names.append(name)
+          assert len(set(n.lower() for n in names)) == len(names), 'object name collision'
+
+          # ---- mmp ----
+          tpl = open('symbian/app/group/sm64.mmp.in').read()
+          macros = set()
+          for k in ('VERSION_CFLAGS_RAW', 'GRUCODE_CFLAGS_RAW', 'BACKEND_CFLAGS_RAW'):
+              for t in V.get(k, '').split():
+                  if t.startswith('-D'):
+                      macros.add(t[2:])
+          macros.discard('')
+          have = set(re.findall(r'^MACRO\s+(\S+)', tpl, flags=re.M))
+          extra_macros = ''.join('MACRO           %s\n' % m for m in sorted(macros) if m not in have
+                                 and not m.startswith(('GIT_HASH', 'COMPILE_TIME', 'NIGHTLY')))
+          game = 'SOURCEPATH      ../gen\n' + ''.join('SOURCE          %s\n' % n for n in names)
+          inc = ''.join('USERINCLUDE     ../../../%s\n' % d for d in
+                        ('.', 'include', 'src', BUILD, BUILD + '/include', 'src/pc/symbian'))
+          fpu = '-march=armv6 -mfpu=vfp -mfloat-abi=softfp' if args.fpu == 'vfp' else '-march=armv6 -mfloat-abi=soft'
+          mmp = (tpl.replace('@GAME_SOURCES@', game).replace('@USERINCLUDES@', inc).replace('@OPT@', args.opt)
+                 .replace('@FPU@', fpu).replace('@GCCINC@', args.gccinc))
+          mmp = mmp.replace('MACRO           NDEBUG\n', 'MACRO           NDEBUG\n' + extra_macros, 1)
+          open('symbian/app/group/sm64.mmp', 'w').write(mmp)
+          print('sources: %d wrappers, macros: %s' % (len(names), sorted(macros)))
+          EOF_SM64
+          cat > /tmp/sm64_symbian.patch <<'EOF_SM64'
+          --- a/Makefile
+          +++ b/Makefile
+          @@ -55,6 +55,19 @@
+           # Enable Discord Rich Presence
+           DISCORDRPC ?= 0
+           
+          +# Build for Symbian^3 (GLES2, Open C, GCCE). The real compile/link is done by the Symbian toolchain (abld);
+          +# this Makefile is only used on the host to generate assets (symbian/tools/prepare_symbian.py).
+          +TARGET_SYMBIAN ?= 0
+          +ifeq ($(TARGET_SYMBIAN),1)
+          +  TARGET_IOS := 0
+          +  OSX_BUILD := 0
+          +  RENDER_API := GL
+          +  WINDOW_API := SYMBIAN
+          +  AUDIO_API := SYMBIAN
+          +  CONTROLLER_API := SYMBIAN
+          +  NO_BZERO_BCOPY := 1
+          +endif
+          +
+           # Various workarounds for weird toolchains
+           
+           NO_BZERO_BCOPY ?= 0
+          @@ -225,6 +238,10 @@
+                 VERSION_CFLAGS += -DUSE_GLES
+           endif
+           
+          +ifeq ($(TARGET_SYMBIAN),1)
+          +     VERSION_CFLAGS += -DUSE_GLES -DTARGET_SYMBIAN
+          +endif
+          +
+           ifeq ($(OSX_BUILD),1) # Modify GFX & SDL2 for OSX GL
+                VERSION_CFLAGS += -DOSX_BUILD
+           endif
+          @@ -331,6 +348,10 @@
+             SRC_DIRS += src/pc/discord
+           endif
+           
+          +ifeq ($(TARGET_SYMBIAN),1)
+          +  SRC_DIRS += src/pc/symbian
+          +endif
+          +
+           ifdef TARGET_OS_IOS
+             SRC_DIRS += src/ios/ios
+           endif
+          @@ -948,12 +969,19 @@
+           $(BUILD_DIR)/rsp/%.bin $(BUILD_DIR)/rsp/%_data.bin: rsp/%.s
+           	$(RSPASM) -sym $@.sym -definelabel $(VERSION_DEF) 1 -definelabel $(GRUCODE_DEF) 1 -strequ CODE_FILE $(BUILD_DIR)/rsp/$*.bin -strequ DATA_FILE $(BUILD_DIR)/rsp/$*_data.bin $<
+           
+          +ifeq ($(TARGET_SYMBIAN),1)
+          +# the host generates data for an ARM11 little-endian 32-bit target
+          +$(ENDIAN_BITWIDTH): tools/determine-endian-bitwidth.c
+          +	@mkdir -p $(@D)
+          +	echo "--endian little --bitwidth 32" > $@
+          +else
+           $(ENDIAN_BITWIDTH): tools/determine-endian-bitwidth.c
+           	$(CC) -c $(CFLAGS) -o $@.dummy2 $< 2>$@.dummy1; true
+           	grep -o 'msgbegin --endian .* --bitwidth .* msgend' $@.dummy1 > $@.dummy2
+           	head -n1 <$@.dummy2 | cut -d' ' -f2-5 > $@
+           	@rm $@.dummy1
+           	@rm $@.dummy2
+          +endif
+           
+           $(SOUND_BIN_DIR)/sound_data.ctl: sound/sound_banks/ $(SOUND_BANK_FILES) $(SOUND_SAMPLE_AIFCS) $(ENDIAN_BITWIDTH)
+           	$(PYTHON) tools/assemble_sound.py $(BUILD_DIR)/sound/samples/ sound/sound_banks/ $(SOUND_BIN_DIR)/sound_data.ctl $(SOUND_BIN_DIR)/sound_data.tbl $(VERSION_CFLAGS) $$(cat $(ENDIAN_BITWIDTH))
+          --- a/sound/sound_data.c
+          +++ b/sound/sound_data.c
+          @@ -1,15 +1,15 @@
+          -unsigned char gSoundDataADSR[] = {
+          +__attribute__((aligned(16))) unsigned char gSoundDataADSR[] = {
+           #include "sound/sound_data.ctl.inc.c"
+           };
+           
+          -unsigned char gSoundDataRaw[] = {
+          +__attribute__((aligned(16))) unsigned char gSoundDataRaw[] = {
+           #include "sound/sound_data.tbl.inc.c"
+           };
+           
+          -unsigned char gMusicData[] = {
+          +__attribute__((aligned(16))) unsigned char gMusicData[] = {
+           #include "sound/sequences.bin.inc.c"
+           };
+           
+          -unsigned char gBankSetsData[] = {
+          +__attribute__((aligned(16))) unsigned char gBankSetsData[] = {
+           #include "sound/bank_sets.inc.c"
+           };
+          --- a/src/pc/cliopts.c
+          +++ b/src/pc/cliopts.c
+          @@ -4,6 +4,9 @@
+           #include "pc_main.h"
+           #include "platform.h"
+           #include "macros.h"
+          +#ifdef TARGET_SYMBIAN
+          +#include "symbian/sym_host.h"
+          +#endif
+           
+           #include <strings.h>
+           #include <stdlib.h>
+          @@ -45,6 +48,10 @@
+               // Initialize options with false values.
+               memset(&gCLIOpts, 0, sizeof(gCLIOpts));
+           
+          +#ifdef TARGET_SYMBIAN
+          +    arg_string("--savepath", sym_user_dir(), gCLIOpts.SavePath);
+          +    arg_string("--gamedir", sym_user_dir(), gCLIOpts.GameDir);
+          +#else
+               char spbuf[512];
+               strcpy(spbuf, getenv("HOME"));
+               strcat(spbuf, "/Documents");
+          @@ -55,6 +62,8 @@
+               strcat(gdbuf, "/Documents");
+               arg_string("--gamedir", gdbuf, gCLIOpts.GameDir);
+               
+          +#endif
+          +
+               for (int i = 1; i < argc; i++) {
+                   if (strcmp(argv[i], "--skip-intro") == 0) // Skip Peach Intro
+                       gCLIOpts.SkipIntro = 1;
+          --- a/src/pc/gfx/gfx_opengl.c
+          +++ b/src/pc/gfx/gfx_opengl.c
+          @@ -28,6 +28,11 @@
+           # else
+           #  include <SDL2/SDL_opengl.h>
+           # endif
+          +#elif defined(WAPI_SYMBIAN)
+          +# include <GLES2/gl2.h>
+          +# include <GLES2/gl2ext.h>
+          +# include "../symbian/sym_host.h"
+          +# define fprintf(f, ...) sym_log(__VA_ARGS__) /* shader logs end up in sm64.log */
+           #elif defined(WAPI_SDL1)
+           # include <SDL/SDL.h>
+           # ifndef GLEW_STATIC
+          @@ -313,13 +318,13 @@
+           
+               if (used_textures[0] || used_textures[1]) {
+                   if (configFiltering == 2) {
+          -            append_line(fs_buf, &fs_len, "#define TEX_OFFSET(off) texture2D(tex, texCoord - (off)/texSize)");
+          +            append_line(fs_buf, &fs_len, "vec4 texOff(in sampler2D tex, in vec2 texCoord, in vec2 texSize, in vec2 off) { return texture2D(tex, texCoord - off/texSize); }");
+                       append_line(fs_buf, &fs_len, "vec4 filter3point(in sampler2D tex, in vec2 texCoord, in vec2 texSize) {");
+                       append_line(fs_buf, &fs_len, "  vec2 offset = fract(texCoord*texSize - vec2(0.5));");
+                       append_line(fs_buf, &fs_len, "  offset -= step(1.0, offset.x + offset.y);");
+          -            append_line(fs_buf, &fs_len, "  vec4 c0 = TEX_OFFSET(offset);");
+          -            append_line(fs_buf, &fs_len, "  vec4 c1 = TEX_OFFSET(vec2(offset.x - sign(offset.x), offset.y));");
+          -            append_line(fs_buf, &fs_len, "  vec4 c2 = TEX_OFFSET(vec2(offset.x, offset.y - sign(offset.y)));");
+          +            append_line(fs_buf, &fs_len, "  vec4 c0 = texOff(tex, texCoord, texSize, offset);");
+          +            append_line(fs_buf, &fs_len, "  vec4 c1 = texOff(tex, texCoord, texSize, vec2(offset.x - sign(offset.x), offset.y));");
+          +            append_line(fs_buf, &fs_len, "  vec4 c2 = texOff(tex, texCoord, texSize, vec2(offset.x, offset.y - sign(offset.y)));");
+                       append_line(fs_buf, &fs_len, "  return c0 + abs(offset.x)*(c1-c0) + abs(offset.y)*(c2-c0);");
+                       append_line(fs_buf, &fs_len, "}");
+                       append_line(fs_buf, &fs_len, "vec4 sampleTex(in sampler2D tex, in vec2 uv, in vec2 texSize, in bool dofilter) {");
+          --- a/src/pc/platform.c
+          +++ b/src/pc/platform.c
+          @@ -80,7 +80,23 @@
+               sys_fatal_impl(msg);
+           }
+           
+          -#ifdef HAVE_SDL2
+          +#if defined(TARGET_SYMBIAN)
+          +
+          +#include "symbian/sym_host.h"
+          +
+          +const char *sys_user_path(void) {
+          +    return sym_user_dir();
+          +}
+          +
+          +const char *sys_exe_path(void) {
+          +    return sym_user_dir();
+          +}
+          +
+          +static void sys_fatal_impl(const char *msg) {
+          +    sym_fatal(msg);
+          +}
+          +
+          +#elif defined(HAVE_SDL2)
+           
+           // we can just ask SDL for most of this shit if we have it
+           #include <SDL2/SDL.h>
+          EOF_SM64
+          patch -p1 --no-backup-if-mismatch < /tmp/sm64_symbian.patch
+          chmod +x symbian/tools/fakecc.sh symbian/tools/prepare_symbian.py
+
+      - name: Host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential python3 libcapstone-dev pkg-config libpng-dev libsdl2-dev binutils-mips-linux-gnu || true
+
+      - name: Fetch ROM (yours, from Google Drive)
+        env:
+          ROM_ID: ${{ inputs.rom_file_id || secrets.DRIVE_ROM_ID }}
+        run: |
+          set -euo pipefail
+          [ -n "${ROM_ID:-}" ] || { echo "::error::ROM id missing (rom_file_id or secret DRIVE_ROM_ID)"; exit 1; }
+          ROM_ID="$(echo "$ROM_ID" | tr -d ' \r\n' | sed -E 's#.*/d/([A-Za-z0-9_-]+).*#\1#; s#.*[?&]id=([A-Za-z0-9_-]+).*#\1#')"
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install -q gdown
+          "$RUNNER_TEMP/venv/bin/gdown" "$ROM_ID" -O baserom.us.z64
+          sha1sum baserom.us.z64
+          grep -q "$(sha1sum baserom.us.z64 | cut -d' ' -f1)" sm64.us.sha1 || { echo "::error::ROM is not the US z64 (big-endian) dump"; exit 1; }
+
+      - name: Generate (assets, wrappers, mmp)
+        run: |
+          set -eo pipefail
+          python3 symbian/tools/prepare_symbian.py --opt "${{ inputs.opt }}" --fpu "${{ inputs.fpu }}" 2>&1 | tee prepare.log
+
+      - name: Host syntax check of the port's portable C
+        run: |
+          set -e
+          F="-fsyntax-only -fsigned-char -I include -I build/us_pc -I build/us_pc/include -I src -I . -I src/pc/symbian -DVERSION_US -D_LANGUAGE_C -DNON_MATCHING -DAVOID_UB -DUSE_GLES -DTARGET_SYMBIAN -DRAPI_GL=1 -DWAPI_SYMBIAN=1 -DAAPI_SYMBIAN=1 -DCAPI_SYMBIAN=1 -DNO_BZERO_BCOPY -DEXT_OPTIONS_MENU -DF3DEX_GBI_2E"
+          for f in src/pc/symbian/sym_host.c src/pc/gfx/gfx_symbian.c src/pc/audio/audio_symbian.c src/pc/controller/controller_symbian.c src/pc/pc_main_symbian.c; do gcc $F $f; done
+
+      - name: Pack tree
+        run: |
+          rm -f baserom.*.z64
+          tar --exclude=.git --exclude='build/us_pc/**/*.o' -czf tree.tgz .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tree
+          retention-days: 1
+          path: tree.tgz
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: prepare-log
+          path: prepare.log
+          if-no-files-found: ignore
+
+  build-sis:
+    name: Build sm64.sisx
+    needs: assets
+    runs-on: ${{ inputs.runner || 'macos-15' }}
+    timeout-minutes: 360
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: tree
+          path: .
+      - name: Unpack
+        run: tar -xzf tree.tgz && rm tree.tgz
+      - name: Check out symbian3-toolchain
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.TOOLCHAIN_REPO }}
+          ref: ${{ env.TOOLCHAIN_REF }}
+          path: toolchain
+      - name: Create case-sensitive APFS volume
+        run: |
+          hdiutil create -size 24g -fs "Case-sensitive APFS" -volname Symbian -type SPARSE "$RUNNER_TEMP/symbian"
+          hdiutil attach "$RUNNER_TEMP/symbian.sparseimage" -mountpoint "$SYMBIAN_VOL"
+          sudo chown "$(id -u):$(id -g)" "$SYMBIAN_VOL"
+      - name: Install Homebrew dependencies and Rosetta
+        run: |
+          brew install perl openssl@3 unshield make gmp mpfr libmpc isl gnu-sed
+          brew unlink perl
+          sudo softwareupdate --install-rosetta --agree-to-license || true
+      - name: Restore toolchain cache
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            /Volumes/Symbian/toolchain
+            /Volumes/Symbian/sdks
+            /Volumes/Symbian/gnupoc
+          key: symbian3-toolchain-${{ env.TOOLCHAIN_REF }}-${{ env.GNUPOC_COMMIT }}-${{ env.GCC4SYMBIAN_COMMIT }}
+      - name: Build toolchain and install SDK (cache miss)
+        if: steps.cache.outputs.cache-hit != 'true'
+        env:
+          JOBS: 4
+        run: |
+          set -eo pipefail
+          cd toolchain
+          source Scripts/env.sh
+          mkdir -p "$N8_SRC"
+          git clone https://github.com/mstorsjo/gnupoc-package "$N8_SRC/gnupoc-package"
+          git -C "$N8_SRC/gnupoc-package" checkout "$GNUPOC_COMMIT"
+          git clone https://github.com/fedor4ever/GCC4Symbian "$N8_SRC/GCC4Symbian"
+          git -C "$N8_SRC/GCC4Symbian" checkout "$GCC4SYMBIAN_COMMIT"
+          Scripts/fetch-sdk.sh
+          Scripts/build-host-tools.sh
+          Scripts/build-gcc.sh
+          Scripts/install-sdk.sh
+      - name: Save toolchain cache
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            /Volumes/Symbian/toolchain
+            /Volumes/Symbian/sdks
+            /Volumes/Symbian/gnupoc
+          key: ${{ steps.cache.outputs.cache-primary-key }}
+      - name: Check Open C and GLES in the SDK
+        run: |
+          source toolchain/Scripts/env.sh
+          ls "${EPOCROOT}epoc32/include/stdapis/stdio.h" "${EPOCROOT}epoc32/include/GLES2/gl2.h" "${EPOCROOT}epoc32/include/EGL/egl.h" || true
+          arm-none-symbianelf-gcc -print-file-name=include
+      - name: Build sm64
+        run: |
+          set -eo pipefail
+          source toolchain/Scripts/env.sh
+          GCCINC="$(arm-none-symbianelf-gcc -print-file-name=include)"
+          cd symbian/app/group
+          sed -i.bak "s|@GCCINC@|$GCCINC|" sm64.mmp
+          bldmake bldfiles
+          if ! abld build -keepgoing gcce urel; then
+            echo "::warning::build failed, retrying without multi-touch (Z3_MULTITOUCH)"
+            sed -i.bak2 "/Z3_MULTITOUCH/d" sm64.mmp
+            abld reallyclean gcce urel || true
+            bldmake bldfiles
+            abld build gcce urel
+          fi
+          test -f "${EPOCROOT}epoc32/release/gcce/urel/sm64.exe"
+          ls -l "${EPOCROOT}epoc32/release/gcce/urel/sm64.exe"
+      - name: Package SIS
+        run: |
+          set -eo pipefail
+          source toolchain/Scripts/env.sh
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          "$N8_REPO/Scripts/package-sis.sh" symbian/app/sis/sm64.pkg "$GITHUB_WORKSPACE/dist"
+          ls -l "$GITHUB_WORKSPACE/dist"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sm64-symbian3
+          path: dist/sm64.sisx
+          if-no-files-found: error
