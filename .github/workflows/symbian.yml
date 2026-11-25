@@ -3064,7 +3064,7 @@ jobs:
       - name: Generate (assets, wrappers, mmp)
         run: |
           set -eo pipefail
-          python3 symbian/tools/prepare_symbian.py --opt="${{ inputs.opt }}" --fpu="${{ inputs.fpu }}" 2>&1 | tee prepare.log
+          python3 symbian/tools/prepare_symbian.py --opt="${{ inputs.opt }}" --fpu="${{ inputs.fpu }}" --gccinc=@GCCINC@ 2>&1 | tee prepare.log
 
       - name: Host syntax check of the port's portable C
         run: |
@@ -3075,13 +3075,13 @@ jobs:
       - name: Pack tree
         run: |
           rm -f baserom.*.z64
-          tar --exclude=.git --exclude='build/us_pc/**/*.o' -czf tree.tgz .
+          tar --exclude=.git --exclude='build/us_pc/**/*.o' -czf "$RUNNER_TEMP/tree.tgz" .
 
       - uses: actions/upload-artifact@v4
         with:
           name: tree
           retention-days: 1
-          path: tree.tgz
+          path: ${{ runner.temp }}/tree.tgz
 
       - uses: actions/upload-artifact@v4
         if: always()
