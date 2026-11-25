@@ -2728,7 +2728,13 @@ jobs:
           ap.add_argument('--gccinc', default='/usr/include')
           ap.add_argument('--skip-make', action='store_true')
           ap.add_argument('--version', default='us')
-          args = ap.parse_args()
+          argv = []
+          for a in sys.argv[1:]:
+              if argv and argv[-1] in ('--opt', '--fpu') and a.startswith('-'):
+                  argv[-1] += '=' + a        # argparse would take '-O2' for an option
+              else:
+                  argv.append(a)
+          args = ap.parse_args(argv)
 
           FAKE = os.path.join(ROOT, 'symbian/tools/fakecc.sh')
           MK = ['make', 'TARGET_SYMBIAN=1', 'TARGET_IOS=0', 'VERSION=' + args.version, 'CC=' + FAKE, 'CXX=' + FAKE]
@@ -3055,7 +3061,7 @@ jobs:
       - name: Generate (assets, wrappers, mmp)
         run: |
           set -eo pipefail
-          python3 symbian/tools/prepare_symbian.py --opt "${{ inputs.opt }}" --fpu "${{ inputs.fpu }}" 2>&1 | tee prepare.log
+          python3 symbian/tools/prepare_symbian.py --opt="${{ inputs.opt }}" --fpu="${{ inputs.fpu }}" 2>&1 | tee prepare.log
 
       - name: Host syntax check of the port's portable C
         run: |
