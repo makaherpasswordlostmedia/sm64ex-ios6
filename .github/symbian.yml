@@ -3055,7 +3055,7 @@ jobs:
       - name: Generate (assets, wrappers, mmp)
         run: |
           set -eo pipefail
-          python3 symbian/tools/prepare_symbian.py --opt "${{ inputs.opt }}" --fpu "${{ inputs.fpu }}" 2>&1 | tee prepare.log
+          python3 symbian/tools/prepare_symbian.py --opt="${{ inputs.opt }}" --fpu="${{ inputs.fpu }}" 2>&1 | tee prepare.log
 
       - name: Host syntax check of the port's portable C
         run: |
