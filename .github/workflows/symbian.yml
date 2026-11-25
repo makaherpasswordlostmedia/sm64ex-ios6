@@ -2747,6 +2747,9 @@ jobs:
                   sys.exit('failed: %s' % cmd[0])
               return r.returncode
 
+          # host tools must be built with the real compiler (the fake one would be inherited by tools/Makefile)
+          run(['make', '-C', 'tools'] + J)
+
           # ---- variables ----
           DUMP = os.path.join(ROOT, 'symbian/tools/.dump.mk')
           VARS = ['C_FILES', 'M_FILES', 'GODDARD_C_FILES', 'ULTRA_C_FILES', 'GENERATED_C_FILES', 'BUILD_DIR',
