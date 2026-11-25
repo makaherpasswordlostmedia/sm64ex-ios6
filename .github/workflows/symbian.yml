@@ -2748,7 +2748,7 @@ jobs:
               return r.returncode
 
           # host tools must be built with the real compiler (the fake one would be inherited by tools/Makefile)
-          run(['make', '-C', 'tools'] + J)
+          run(['make', '-C', 'tools'])   # serial: tools/Makefile has an ordering race under -j
 
           # ---- variables ----
           DUMP = os.path.join(ROOT, 'symbian/tools/.dump.mk')
